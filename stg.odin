@@ -1,0 +1,84 @@
+//
+// Simple Task Graph (STG)
+//
+
+package stg
+
+import "core:sync"
+
+// - init
+// - create thread groups
+// - declare tasks:
+// - run: push_task(ctx, task_proc, data) / push_task(ctx, task_proc, data, ticket)
+
+// job tracker /////////////////////////////////////////////////////////////////
+
+JobTracker :: struct {
+    mutex: sync.Mutex,
+    cond: sync.Cond,
+    steps: int,
+}
+
+job_done_tracker :: proc(tracker: ^JobTracker)
+{
+    sync.atomic_add(&tracker.steps, 1)
+    sync.cond_broadcast(&tracker.cond)
+}
+
+job_done_data :: proc(data: Data)
+{
+    ensure(data.job_tracker != nil, "called `job_done` with nil data job tracker is nil")
+    job_done_tracker(data.job_tracker)
+}
+
+job_done :: proc { job_done_tracker, job_done_data }
+
+job_wait :: proc(tracker: ^JobTracker, step_count := 1)
+{
+    sync.mutex_lock(&tracker.mutex)
+    for {
+        if sync.atomic_load(&tracker.steps) == step_count do break
+        sync.cond_wait(&tracker.cond, &tracker.mutex)
+    }
+    sync.mutex_unlock(&tracker.mutex)
+}
+
+// data ////////////////////////////////////////////////////////////////////////
+
+Data :: struct {
+    ptr: rawptr,
+    type: int,
+    job_tracker: ^JobTracker,
+    // pool: ^DataPool,
+}
+
+// tasks ///////////////////////////////////////////////////////////////////////
+
+TaskContext :: struct {
+    worker: ^Worker,
+    task_info: ^TaskInfo,
+    // shared_space_slot: int, // TODO shared space for parallel tasks
+}
+
+TaskProcStandard :: proc(ctx: TaskContext, data: Data)
+TaskProcParallel :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: int)
+
+TaskProc :: union {
+    TaskProcStandard,
+    TaskProcParallel,
+}
+
+push_job_task :: proc(ctx: TaskContext, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil)
+{
+    push_job_runner(ctx.worker.group.runner, task_proc, data, tracker)
+}
+
+push_job :: proc {
+    push_job_runner,
+    push_job_task,
+}
+
+thread_id :: proc(ctx: TaskContext) -> int
+{
+    return ctx.worker.id
+}

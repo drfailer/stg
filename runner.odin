@@ -48,7 +48,7 @@ runner_stop :: proc(runner: ^Runner)
     }
 }
 
-add_thread_group :: proc(runner: ^Runner, thread_count: int) -> ^WorkerGroup
+add_thread_group :: proc(runner: ^Runner, thread_count: uint) -> ^WorkerGroup
 {
     allocator := vmem.arena_allocator(&runner.arena)
     group := new(WorkerGroup, allocator)
@@ -74,10 +74,10 @@ push_job_runner :: proc(runner: ^Runner, task_proc: TaskProc, data := Data{}, tr
 
 TaskInfo :: struct {
     procedure: TaskProc,
-    max_instances_count: int, // maximum number of instances for this task (if 1, only one worker will execute this task at a time)
-    thread_count: int,        // number of helper threads requested by the task
+    max_instances_count: uint, // maximum number of instances for this task (if 1, only one worker will execute this task at a time)
+    thread_count: uint,        // number of helper threads requested by the task
     data: rawptr,             // the tasks can have an associated data
-    barrier: sync.Barrier,    // used for parallel tasks
+    barrier: sync.Barrier,    // used for shared tasks
     queue: MPMCQueue(Data, 1024),
     // --- the queue is aligned so it adds some padding for the locks atomics
     active_worker_count: uint,
@@ -93,7 +93,7 @@ WorkerGroup :: struct {
     workers: [dynamic]^Worker,
     worker_run_mutex: sync.Mutex,
     worker_run_cond: sync.Cond,
-    process_count: int,
+    process_count: uint,
     // TODO: we may also want a job queue here for temporary work (non registered tasks)
     _pad0: [CACHE_LINE]u8,
     work_count: uint,
@@ -101,7 +101,7 @@ WorkerGroup :: struct {
     ttl_required_worker_count: uint,
 }
 
-worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, thread_count: int)
+worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, thread_count: uint)
     where W == Worker || intrinsics.type_is_subtype_of(W, Worker)
 {
     allocator := vmem.arena_allocator(&runner.arena)
@@ -111,7 +111,7 @@ worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: 
     for i in 0..<thread_count {
         group.workers[i] = new(W, allocator)
         group.workers[i].group = group
-        group.workers[i].id = i
+        group.workers[i].id = int(i)
     }
     group.tasks_infos = make([dynamic]TaskInfo)
 }
@@ -137,7 +137,7 @@ worker_group_stop :: proc(group: ^WorkerGroup)
     delete(group.tasks_infos)
 }
 
-add_task :: proc(group: ^WorkerGroup, task_proc: TaskProc, max_instances_count: int, data : rawptr = nil)
+add_task :: proc(group: ^WorkerGroup, task_proc: TaskProc, max_instances_count: uint, data : rawptr = nil)
 {
     task_info := TaskInfo{
         procedure = task_proc,
@@ -151,12 +151,12 @@ add_task :: proc(group: ^WorkerGroup, task_proc: TaskProc, max_instances_count: 
     group.runner.tasks_indices[task_proc] = TaskIndex{group, task_index}
 }
 
-add_parallel_task :: proc(group: ^WorkerGroup, task_proc: TaskProc, max_instances_count, thread_count: int, data : rawptr = nil)
+add_shared_task :: proc(group: ^WorkerGroup, task_proc: TaskProc, max_instances_count, thread_count: uint, data : rawptr = nil)
 {
     add_task(group, task_proc, max_instances_count, data)
     task_info := &group.tasks_infos[len(group.tasks_infos) - 1]
-    task_info.thread_count = min(thread_count, len(group.workers))
-    sync.barrier_init(&task_info.barrier, task_info.thread_count)
+    task_info.thread_count = min(thread_count, uint(len(group.workers)))
+    sync.barrier_init(&task_info.barrier, int(task_info.thread_count))
 }
 
 @(private="file")
@@ -166,10 +166,10 @@ worker_group_add_work :: proc(group: ^WorkerGroup, task_info: ^TaskInfo, work_co
     sync.atomic_add(&group.work_count, work_count)
 
     if !sync.atomic_exchange(&task_info.ready_flag, true) {
-        sync.atomic_add(&group.ttl_required_worker_count, uint(task_info.max_instances_count * task_info.thread_count))
+        sync.atomic_add(&group.ttl_required_worker_count, task_info.max_instances_count * task_info.thread_count)
         sync.cond_signal(&group.worker_run_cond)
     } else {
-        if sync.atomic_load(&task_info.active_worker_count) < uint(task_info.max_instances_count * task_info.thread_count) {
+        if sync.atomic_load(&task_info.active_worker_count) < task_info.max_instances_count * task_info.thread_count {
             sync.cond_signal(&group.worker_run_cond)
         }
     }
@@ -181,7 +181,7 @@ Worker :: struct #align(CACHE_LINE) {
     thread: ^thread.Thread,
     group: ^WorkerGroup,
     id: int,
-    process_count: int,
+    process_count: uint,
     _pad0: [CACHE_LINE]u8,
     parked: bool,
     _pad1: [CACHE_LINE - size_of(bool)]u8,
@@ -241,7 +241,7 @@ process_tasks :: proc(worker: ^Worker) {
         }
 
         task_info := &group.tasks_infos[task_index]
-        task_max_worker_count := uint(task_info.max_instances_count * task_info.max_instances_count)
+        task_max_worker_count := task_info.max_instances_count * task_info.max_instances_count
 
         if !sync.atomic_load(&task_info.ready_flag) {
             task_index += 1
@@ -281,7 +281,7 @@ process_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 {
     switch procedure in task_info.procedure {
     case TaskProcStandard: process_standard_task(worker, task_info)
-    case TaskProcParallel: process_parallel_task(worker, task_info)
+    case TaskProcShared: process_shared_task(worker, task_info)
     }
 }
 
@@ -304,7 +304,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
         if process_count > queues_size {
             sync.atomic_sub(&group.work_count, process_count - queues_size)
         }
-        worker.process_count += int(process_count)
+        worker.process_count += process_count
     } else {
         for {
             sync.atomic_sub(&group.work_count, 1)
@@ -326,7 +326,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 }
 
 @(private="file")
-process_parallel_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
+process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 {
     panic("unimplemented")
 }
@@ -334,11 +334,11 @@ process_parallel_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 @(private="file")
 make_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
     if sync.atomic_exchange(&task_info.ready_flag, false) {
-        sync.atomic_sub(&group.ttl_required_worker_count, uint(task_info.max_instances_count))
+        sync.atomic_sub(&group.ttl_required_worker_count, task_info.max_instances_count)
     }
     if queue_size(&task_info.queue) > 0 {
         if !sync.atomic_exchange(&task_info.ready_flag, true) {
-            sync.atomic_add(&group.ttl_required_worker_count, uint(task_info.max_instances_count))
+            sync.atomic_add(&group.ttl_required_worker_count, task_info.max_instances_count)
         }
         sync.cond_signal(&group.worker_run_cond)
     }
@@ -350,5 +350,5 @@ compute_task_expected_worker_count :: proc(worker: ^Worker, task_info: ^TaskInfo
     group_size := uint(len(group.workers))
     ttl := sync.atomic_load(&group.ttl_required_worker_count)
     if ttl == 0 { return 0 }
-    return max(group_size * uint(task_info.max_instances_count) * uint(task_info.thread_count) / ttl, 1)
+    return max((group_size * task_info.max_instances_count * task_info.thread_count) / ttl, 1)
 }

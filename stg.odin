@@ -61,11 +61,11 @@ TaskContext :: struct {
 }
 
 TaskProcStandard :: proc(ctx: TaskContext, data: Data)
-TaskProcParallel :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: int)
+TaskProcShared :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: int)
 
 TaskProc :: union {
     TaskProcStandard,
-    TaskProcParallel,
+    TaskProcShared,
 }
 
 push_job_task :: proc(ctx: TaskContext, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil)

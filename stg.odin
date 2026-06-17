@@ -52,8 +52,8 @@ job_wait :: proc(tracker: ^JobTracker)
 // data ////////////////////////////////////////////////////////////////////////
 
 Data :: struct {
-    ptr: rawptr,
     type: int,
+    ptr: rawptr,
     job_tracker: ^JobTracker,
     // pool: ^DataPool,
 }
@@ -63,11 +63,11 @@ Data :: struct {
 TaskContext :: struct {
     worker: ^Worker,
     task_info: ^TaskInfo,
-    // shared_space_slot: int, // TODO shared space for parallel tasks
+    shared_space: ^SharedSpace,
 }
 
 TaskProcStandard :: proc(ctx: TaskContext, data: Data)
-TaskProcShared :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: int)
+TaskProcShared :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: uint)
 
 TaskProc :: union {
     TaskProcStandard,

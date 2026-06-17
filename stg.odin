@@ -19,10 +19,16 @@ JobTracker :: struct {
     steps: int,
 }
 
+job_tracker :: proc(step_count := 1) -> JobTracker
+{
+    return JobTracker{steps = step_count}
+}
+
 job_done_tracker :: proc(tracker: ^JobTracker)
 {
-    sync.atomic_add(&tracker.steps, 1)
-    sync.cond_broadcast(&tracker.cond)
+    if sync.atomic_sub(&tracker.steps, 1) <= 1 {
+        sync.cond_broadcast(&tracker.cond)
+    }
 }
 
 job_done_data :: proc(data: Data)
@@ -33,11 +39,11 @@ job_done_data :: proc(data: Data)
 
 job_done :: proc { job_done_tracker, job_done_data }
 
-job_wait :: proc(tracker: ^JobTracker, step_count := 1)
+job_wait :: proc(tracker: ^JobTracker)
 {
     sync.mutex_lock(&tracker.mutex)
     for {
-        if sync.atomic_load(&tracker.steps) == step_count do break
+        if sync.atomic_load(&tracker.steps) <= 0 do break
         sync.cond_wait(&tracker.cond, &tracker.mutex)
     }
     sync.mutex_unlock(&tracker.mutex)

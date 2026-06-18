@@ -425,8 +425,8 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 @(private="file")
 process_shared_tasks :: proc(worker: ^Worker)
 {
-    sync.atomic_add(&worker.group.standard_tasks_workload_info.worker_count, 1)
-    defer sync.atomic_sub(&worker.group.standard_tasks_workload_info.worker_count, 1)
+    sync.atomic_add(&worker.group.shared_tasks_workload_info.worker_count, 1)
+    defer sync.atomic_sub(&worker.group.shared_tasks_workload_info.worker_count, 1)
 
     wi := &worker.group.shared_tasks_workload_info
     worker_count := len(worker.group.workers)
@@ -451,6 +451,12 @@ process_shared_tasks :: proc(worker: ^Worker)
 
         if sync.atomic_add(&task_info.active_worker_count, 1) < task_info.thread_count {
             worker.local_index = sync.atomic_add(&task_info.shared_space.thread_counter, 1)
+            if worker.local_index == 0 {
+                // TODO: we commited to allocated worker to this task, therefore,
+                //       we need a way to notify the next worker that the have to
+                //       come here. (we need an extra counter that we check when
+                //       routing the workers to the standard and shared paths)
+            }
             process_shared_task(worker, task_info)
             // we let the threads escape without restriction, but only the last
             // one is allowed to reset the task and unlock it
@@ -506,7 +512,7 @@ make_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
 
     // try to update the ready flag and the required worker count on success
     if sync.atomic_exchange(&task_info.is_ready, false) {
-        sync.atomic_sub(&group.standard_tasks_workload_info.required_worker_count, task_info.thread_count)
+        sync.atomic_sub(&wi.required_worker_count, task_info.thread_count)
     }
     // post check of the queue size to handle update edge cases (lock free updates)
     if queue_size(&task_info.queue) > 0 {

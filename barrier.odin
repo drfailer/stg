@@ -30,7 +30,7 @@ barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (succes
     }
 
     state := sync.atomic_load(&barrier.state[state_index^])
-    thread_counter, canceled, done := unpack_state(state)
+    thread_counter, done, canceled := unpack_state(state)
     if canceled do return false
 
     thread_counter = sync.atomic_add(&barrier.state[state_index^], 1) + 1
@@ -63,7 +63,7 @@ barrier_cancel :: proc(barrier: ^Barrier, state_index: ^u8)
     // going to the next barrier)
     if sync.guard(&barrier.mutex) {
         state := sync.atomic_load(&barrier.state[state_index^])
-        thread_counter, canceled, done := unpack_state(state)
+        thread_counter, done, canceled := unpack_state(state)
         if canceled do return
         sync.atomic_store(&barrier.state[1 - state_index^], 0)
         sync.atomic_store(&barrier.state[state_index^], CANCELED_BIT_MASK)

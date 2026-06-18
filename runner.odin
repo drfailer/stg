@@ -75,52 +75,43 @@ push_job_runner :: proc(runner: ^Runner, task_proc: TaskProc, data := Data{}, tr
 // task info ///////////////////////////////////////////////////////////////////
 
 TaskInfo :: struct {
+    kind: TaskKind,
     procedure: TaskProc,
-    consumer_count: uint, // number of workers allowed to dequeue
-    thread_count: uint,   // number of threads per consumer (shared tasks)
+    thread_count: uint,
     data: rawptr,
-    shared_task_data: SharedTaskData,
+    shared_space: SharedSpace,
     queue: MPMCQueue(Data, 1024),
     // --- the queue is aligned so it adds some padding for the locks atomics
-    active_consumer_count: uint,
+    active_worker_count: uint,
     is_ready: bool,
 }
 
-SharedTaskData :: struct {
-    shared_spaces: [dynamic]SharedSpace, // shared per instance
+TaskKind :: enum {
+    Standard,
+    Shared,
 }
 
 SharedSpace :: struct {
-    barrier: sync.Barrier, // TODO: we will eventually need a more flexible barrier
+    barrier: Barrier,
+    thread_counter: uint,
     data: Data,
     has_data: bool,
 }
 
-task_info_create :: proc(procedure: TaskProc, consumer_count, thread_count: uint, data: rawptr) -> ^TaskInfo
+task_info_create :: proc(kind: TaskKind, procedure: TaskProc, thread_count: uint, data: rawptr) -> ^TaskInfo
 {
     task_info := new(TaskInfo)
+    task_info.kind = kind
     task_info.procedure = procedure
-    task_info.consumer_count = consumer_count
     task_info.thread_count = thread_count
     task_info.data = data
     queue_init(&task_info.queue)
-    if thread_count > 1 {
-        task_info.shared_task_data = SharedTaskData{
-            shared_spaces = make([dynamic]SharedSpace, consumer_count),
-        }
-        for &sp in task_info.shared_task_data.shared_spaces {
-            sync.barrier_init(&sp.barrier, int(thread_count))
-        }
-    }
     return task_info
 }
 
 task_info_destroy :: proc(task_info: ^TaskInfo)
 {
     queue_destroy(&task_info.queue)
-    if task_info.thread_count > 1 {
-        delete(task_info.shared_task_data.shared_spaces)
-    }
     free(task_info)
 }
 
@@ -144,7 +135,7 @@ WorkerGroup :: struct {
 
 // TODO: figure out if we need some padding bettween the atomics
 WorkloadInfo :: struct #align(CACHE_LINE) {
-    required_worker_count: uint, // sum(task[i].max_instance_count)
+    required_worker_count: uint, // sum(task[i].thread_count)
     pending_jobs_count: uint,    // number of data in all the queues
     worker_count: uint,          // number of workers in the branch
 }
@@ -195,18 +186,20 @@ worker_group_stop :: proc(group: ^WorkerGroup)
     }
 }
 
-add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, consumer_count: uint, data : rawptr = nil)
+add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint, data : rawptr = nil)
 {
-    ensure(consumer_count <= uint(len(group.workers)), "the task requires too many threads")
-    task_info := task_info_create(procedure, consumer_count, 1, data)
+    ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
+    ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")
+    task_info := task_info_create(.Standard, procedure, thread_count, data)
     append(&group.standard_tasks_infos, task_info)
     group.runner.tasks[procedure] = TaskInfoAndGroup{group, task_info}
 }
 
-add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, consumer_count, thread_count: uint, data : rawptr = nil)
+add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint, data : rawptr = nil)
 {
-    ensure(consumer_count * thread_count <= uint(len(group.workers)), "the task requires too many threads")
-    task_info := task_info_create(procedure, consumer_count, thread_count, data)
+    ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
+    ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")
+    task_info := task_info_create(.Shared, procedure, thread_count, data)
     append(&group.shared_tasks_infos, task_info)
     group.runner.tasks[procedure] = TaskInfoAndGroup{group, task_info}
 }
@@ -224,32 +217,16 @@ worker_group_notify_workers :: proc(group: ^WorkerGroup, count: uint)
 worker_group_account_jobs :: proc(group: ^WorkerGroup, task_info: ^TaskInfo, jobs_count: uint)
 {
     if jobs_count == 0 do return
+    wi := &group.standard_tasks_workload_info if task_info.kind == .Standard else &group.shared_tasks_workload_info
 
-    switch _ in task_info.procedure {
-    case (TaskProcStandard):
-        wi := &group.standard_tasks_workload_info
-        sync.atomic_add(&wi.pending_jobs_count, jobs_count)
-        if !sync.atomic_exchange(&task_info.is_ready, true) {
-            sync.atomic_add(&wi.required_worker_count, task_info.consumer_count)
+    sync.atomic_add(&wi.pending_jobs_count, jobs_count)
+    if !sync.atomic_exchange(&task_info.is_ready, true) {
+        sync.atomic_add(&wi.required_worker_count, task_info.thread_count)
+        worker_group_notify_workers(group, jobs_count)
+    } else {
+        // make sure we have enough workers
+        if sync.atomic_load(&task_info.active_worker_count) < task_info.thread_count {
             worker_group_notify_workers(group, jobs_count)
-        } else {
-            // make sure we have enough workers
-            if sync.atomic_load(&task_info.active_consumer_count) < task_info.consumer_count {
-                worker_group_notify_workers(group, jobs_count)
-            }
-        }
-    case (TaskProcShared):
-        wi := &group.shared_tasks_workload_info
-        sync.atomic_add(&wi.pending_jobs_count, jobs_count)
-        required_worker_count := task_info.consumer_count * task_info.thread_count
-        if !sync.atomic_exchange(&task_info.is_ready, true) {
-            sync.atomic_add(&wi.required_worker_count, required_worker_count)
-            worker_group_notify_workers(group, jobs_count * task_info.thread_count)
-        } else {
-            // TODO: this condition is unclear v
-            if sync.atomic_load(&task_info.active_consumer_count) < task_info.consumer_count {
-                worker_group_notify_workers(group, jobs_count * task_info.thread_count)
-            }
         }
     }
 }
@@ -261,7 +238,6 @@ Worker :: struct #align(CACHE_LINE) {
     group: ^WorkerGroup,
     id: int,
     local_index: uint,
-    instance_index: uint,
     process_count: uint,
     _pad0: [CACHE_LINE]u8,
     parked: bool,
@@ -295,7 +271,8 @@ worker_run :: proc(worker: ^Worker)
             if sync.atomic_load(&worker.can_terminate) do break
             if sync.atomic_load(&worker.group.standard_tasks_workload_info.pending_jobs_count) > 0 do break
             if sync.atomic_load(&worker.group.shared_tasks_workload_info.pending_jobs_count) > 0 do break
-            sync.cond_wait(&worker.group.run_cond, &worker.group.run_mutex)
+            // intrinsics.cpu_relax()
+            sync.cond_wait(&worker.group.run_cond, &worker.group.run_mutex) // FIXME: this can deadlock too
         }
         sync.mutex_unlock(&worker.group.run_mutex)
         if sync.atomic_load(&worker.can_terminate) do break
@@ -309,23 +286,24 @@ worker_run :: proc(worker: ^Worker)
 process_tasks :: proc(worker: ^Worker)
 {
     group := worker.group
-    for {
-        standard_task_required_worker_count := sync.atomic_load(&group.standard_tasks_workload_info.required_worker_count)
-        shared_task_required_worker_count := sync.atomic_load(&group.shared_tasks_workload_info.required_worker_count)
+    standard_task_required_worker_count := sync.atomic_load(&group.standard_tasks_workload_info.required_worker_count)
+    shared_task_required_worker_count := sync.atomic_load(&group.shared_tasks_workload_info.required_worker_count) // FIXME: maybe useless
 
-        if standard_task_required_worker_count == 0 && shared_task_required_worker_count == 0 do break
+    // FIXME: maybe useless
+    if standard_task_required_worker_count == 0 && shared_task_required_worker_count == 0 do return
 
-        standard_task_worker_count := sync.atomic_load(&group.standard_tasks_workload_info.worker_count)
-        standard_task_pending_jobs_count := sync.atomic_load(&group.standard_tasks_workload_info.pending_jobs_count)
+    standard_task_worker_count := sync.atomic_load(&group.standard_tasks_workload_info.worker_count)
+    standard_task_pending_jobs_count := sync.atomic_load(&group.standard_tasks_workload_info.pending_jobs_count)
 
-        if standard_task_worker_count < standard_task_required_worker_count &&
-           standard_task_worker_count < standard_task_pending_jobs_count {
-            process_standard_tasks(worker)
-        } else {
-            // fmt.printfln("worker {}: worker count = {}, required = {}, job count = {}",
-            //     worker.id, standard_task_worker_count, standard_task_required_worker_count, standard_task_pending_jobs_count)
-            // process_shared_tasks(worker)
-        }
+    // fmt.printfln("worker {}: worker count = {}, required = {}, job count = {}",
+    //     worker.id, standard_task_worker_count, standard_task_required_worker_count, standard_task_pending_jobs_count)
+
+    // FIXME: the standard_task_worker_count should not be measured this way
+    if standard_task_worker_count < standard_task_required_worker_count &&
+       standard_task_worker_count < standard_task_pending_jobs_count {
+        process_standard_tasks(worker)
+    } else {
+        process_shared_tasks(worker)
     }
 }
 
@@ -354,33 +332,33 @@ process_standard_tasks :: proc(worker: ^Worker)
         task_info := group.standard_tasks_infos[task_index]
         if !sync.atomic_load(&task_info.is_ready) do continue
 
-        expected_worker_count := compute_task_expected_worker_count(worker, task_info)
+        expected_worker_count := compute_standard_task_expected_worker_count(worker, task_info)
 
         // this happens when the current task just got marked unready, and all
         // the other task are unready, in this case we leave
         if expected_worker_count == 0 do return
 
-        task_active_worker_count := sync.atomic_load(&task_info.active_consumer_count)
+        task_active_worker_count := sync.atomic_load(&task_info.active_worker_count)
 
         // conditions:
-        // 1. too many workers with respect to the task configuration (max consumer count threshold)
+        // 1. too many workers with respect to the task configuration (max thread count threshold)
         // 2. too many workers with respect to the current workload (balance the workers across active tasks)
         // TODO: this condition should also take the queue size into account
-        if task_active_worker_count >= expected_worker_count || task_active_worker_count >= task_info.consumer_count do continue
+        if task_active_worker_count >= expected_worker_count || task_active_worker_count >= task_info.thread_count do continue
 
         // we task ownership of the task and we try to dequeue
-        if sync.atomic_add(&task_info.active_consumer_count, 1) < task_info.consumer_count {
+        if sync.atomic_add(&task_info.active_worker_count, 1) < task_info.thread_count {
             old_process_count := worker.process_count
             process_standard_task(worker, task_info)
             if worker.process_count == old_process_count {
                 // security to make the task unready when no processing was done
-                make_standard_task_unready(worker.group, task_info)
+                make_task_unready(worker.group, task_info)
             }
         } else {
             // ownership race lost with another worker
             intrinsics.cpu_relax()
         }
-        sync.atomic_sub(&task_info.active_consumer_count, 1)
+        sync.atomic_sub(&task_info.active_worker_count, 1)
     }
 }
 
@@ -389,15 +367,16 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 {
     group := worker.group
     ctx := TaskContext{worker, task_info, {}}
+    wi := &group.standard_tasks_workload_info
 
-    if task_info.consumer_count == 1 {
+    if task_info.thread_count == 1 {
         //
         // In single consumer tasks, we process all the queue and we don't
         // leave the task until its done. This is made to decrease the latency
         // of synchronization node which are single threaded.
         //
         queues_size := queue_size(&task_info.queue)
-        sync.atomic_sub(&group.standard_tasks_workload_info.pending_jobs_count, queues_size) // greedy update to avoid atomic_sub in the loop
+        sync.atomic_sub(&wi.pending_jobs_count, queues_size) // greedy update to avoid atomic_sub in the loop
         process_count: uint = 0
         for {
             data := queue_pop(&task_info.queue) or_break
@@ -406,7 +385,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
         }
         // if we processed more elements, we update the pending jobs count
         if process_count > queues_size {
-            sync.atomic_sub(&group.standard_tasks_workload_info.pending_jobs_count, process_count - queues_size)
+            sync.atomic_sub(&wi.pending_jobs_count, process_count - queues_size)
         }
         worker.process_count += process_count
     } else {
@@ -422,10 +401,10 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
         //       more tasks than workers to avoid rebalancing after dequeue.
         //
         for iteration := 0; ; iteration += 1 {
-            sync.atomic_sub(&group.standard_tasks_workload_info.pending_jobs_count, 1) // greedy update to reduce the chance of waking up a new worker for nothing
+            sync.atomic_sub(&wi.pending_jobs_count, 1) // greedy update to reduce the chance of waking up a new worker for nothing
             data, ok := queue_pop(&task_info.queue)
             if !ok {
-                sync.atomic_add(&group.standard_tasks_workload_info.pending_jobs_count, 1) // revert update
+                sync.atomic_add(&wi.pending_jobs_count, 1) // revert update
                 intrinsics.cpu_relax()
                 return
             }
@@ -435,7 +414,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
             // the workers have to leave to rebalance the workload
             if iteration > MULTI_CONSUMER_SELF_BALANCE_CHECK_ITERATION_COUNT {
                 iteration = 0
-                if sync.atomic_load(&task_info.active_consumer_count) > compute_task_expected_worker_count(worker, task_info) {
+                if sync.atomic_load(&task_info.active_worker_count) > compute_standard_task_expected_worker_count(worker, task_info) {
                     break
                 }
             }
@@ -446,72 +425,95 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 @(private="file")
 process_shared_tasks :: proc(worker: ^Worker)
 {
-    panic("shared task need to be rewriten")
-    // sync.atomic_add(&worker.group.shared_task_worker_count, 1) // count the threads waiting before the mutex
-    // defer sync.atomic_sub(&worker.group.shared_task_worker_count, 1)
-    // // TODO: add an early leave condition when the condition are not met
-    // for sync.atomic_load(&worker.group.shared_task_count) > 0 {
-    //     sync.mutex_lock(&worker.group.shared_task_mutex)
-    //
-    //     if queue.len(worker.group.shared_task_queue) == 0 do return
-    //
-    //     ticket := queue.front(&worker.group.shared_task_queue)
-    //     required_worker_count := ticket.task_info.helper_thread_count - ticket.thread_counters[ticket.instance_counter]
-    //     available_workers_count := sync.atomic_load(&worker.group.shared_task_worker_count) +
-    //                                sync.atomic_load(&worker.group.parked_worker_count) + 1
-    //     if available_workers_count >= required_worker_count {
-    //         worker.instance_index = ticket.instance_counter
-    //         worker.local_index = ticket.thread_counters[ticket.instance_counter]
-    //         ticket.thread_counters[ticket.instance_counter] += 1
-    //         if ticket.thread_counters[ticket.instance_counter] == ticket.task_info.helper_thread_count {
-    //             ticket.instance_counter += 1
-    //             if ticket.instance_counter == ticket.task_info.max_thread_count {
-    //                 queue.dequeue(&worker.group.shared_task_queue)
-    //                 sync.atomic_sub(&worker.group.shared_task_count, 1)
-    //             }
-    //         }
-    //         sync.mutex_unlock(&worker.group.shared_task_mutex)
-    //         process_shared_task(worker, ticket.task_info)
-    //     } else {
-    //         sync.mutex_unlock(&worker.group.shared_task_mutex)
-    //         return // leav early?
-    //     }
-    // }
+    sync.atomic_add(&worker.group.standard_tasks_workload_info.worker_count, 1)
+    defer sync.atomic_sub(&worker.group.standard_tasks_workload_info.worker_count, 1)
+
+    wi := &worker.group.shared_tasks_workload_info
+    worker_count := len(worker.group.workers)
+
+    // since we want multiple workers per task, we itereate tasks in order
+    // TODO: in worker_start, we want to sort the shared_tasks (put the small work first to avoid long waiting)
+    for task_info in worker.group.shared_tasks_infos {
+        if !sync.atomic_load(&task_info.is_ready) do continue
+
+        // We only have 2 task kind and we know that the standard tasks are prioritized
+        // over shared tasks. This means that the number of available workers for the
+        // shared tasks is ttl - reserved_for_standard. Here we use both the required
+        // worker count and the jobs count like in the process_tasks condition.
+        standard_task_required_worker_count := sync.atomic_load(&worker.group.standard_tasks_workload_info.required_worker_count)
+        standard_task_pending_jobs_count := sync.atomic_load(&worker.group.standard_tasks_workload_info.pending_jobs_count)
+        standard_task_reserved_worker_count := min(standard_task_required_worker_count, standard_task_pending_jobs_count)
+        // WARN: the result is uint, but the content needs to be int or the condition will always be true
+        available_worker_count := cast(uint)max(0, int(worker_count) - int(standard_task_reserved_worker_count))
+        if available_worker_count < task_info.thread_count do continue // return if sorte?
+
+        if sync.atomic_load(&task_info.active_worker_count) >= task_info.thread_count do continue
+
+        if sync.atomic_add(&task_info.active_worker_count, 1) < task_info.thread_count {
+            worker.local_index = sync.atomic_add(&task_info.shared_space.thread_counter, 1)
+            process_shared_task(worker, task_info)
+            // we let the threads escape without restriction, but only the last
+            // one is allowed to reset the task and unlock it
+            thread_counter := sync.atomic_sub(&task_info.shared_space.thread_counter, 1)
+            if thread_counter == 1 {
+                make_task_unready(worker.group, task_info)
+                sync.atomic_sub(&task_info.active_worker_count, task_info.thread_count)
+            }
+        } else {
+            sync.atomic_sub(&task_info.active_worker_count, 1)
+        }
+    }
 }
 
 @(private="file")
 process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 {
-    panic("shared task need to be rewriten")
-    // shared_space := &task_info.shared_tasks_infos.shared[worker.instance_index]
-    // ctx := TaskContext{worker, task_info, shared_space}
-    //
-    // for {
-    //     if worker.local_index == 0 {
-    //         ctx.shared_space.data, ctx.shared_space.has_data = queue_pop(&task_info.queue)
-    //     }
-    //     sync.barrier_wait(&shared_space.barrier)
-    //     if !ctx.shared_space.has_data do break
-    //     task_info.procedure.(TaskProcShared)(ctx, ctx.shared_space.data, worker.local_index, task_info.helper_thread_count)
-    //     if worker.local_index == 0 {
-    //         sync.atomic_sub(&worker.group.work_count, 1)
-    //     }
-    //     sync.barrier_wait(&shared_space.barrier)
-    // }
+    assert(queue_size(&task_info.queue) > 0)
+    ctx := TaskContext{worker, task_info, &task_info.shared_space}
+    process_count, job_count: uint
+    barrier_state_index: u8
+
+    // we wait for the other threads in the team and we update the job count to
+    // notify the rest of the workers that we are going to process all the data
+    barrier_wait(&task_info.shared_space.barrier, &barrier_state_index, u32(task_info.thread_count))
+    if worker.local_index == 0 {
+        job_count = queue_size(&task_info.queue)
+        sync.atomic_sub(&worker.group.shared_tasks_workload_info.pending_jobs_count, job_count)
+    }
+
+    for {
+        if worker.local_index == 0 {
+            ctx.shared_space.data, ctx.shared_space.has_data = queue_pop(&task_info.queue)
+        }
+        barrier_wait(&task_info.shared_space.barrier, &barrier_state_index, u32(task_info.thread_count))
+        if !ctx.shared_space.has_data do break
+        task_info.procedure.(TaskProcShared)(ctx, ctx.shared_space.data, worker.local_index, task_info.thread_count)
+        barrier_wait(&task_info.shared_space.barrier, &barrier_state_index, u32(task_info.thread_count))
+        process_count += 1
+    }
+
+    // commit additional work if required
+    if worker.local_index == 0 {
+        if process_count > job_count {
+            sync.atomic_sub(&worker.group.shared_tasks_workload_info.pending_jobs_count, process_count - job_count)
+        }
+    }
 }
 
 @(private="file")
-make_standard_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
+make_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
+    wi := &group.standard_tasks_workload_info if task_info.kind == .Standard else &group.shared_tasks_workload_info
+
     // try to update the ready flag and the required worker count on success
     if sync.atomic_exchange(&task_info.is_ready, false) {
-        sync.atomic_sub(&group.standard_tasks_workload_info.required_worker_count, task_info.consumer_count)
+        sync.atomic_sub(&group.standard_tasks_workload_info.required_worker_count, task_info.thread_count)
     }
     // post check of the queue size to handle update edge cases (lock free updates)
     if queue_size(&task_info.queue) > 0 {
         // we help the thread that pushed the new job by trying to make the
         // task ready again for him
         if !sync.atomic_exchange(&task_info.is_ready, true) {
-            sync.atomic_add(&group.standard_tasks_workload_info.required_worker_count, task_info.consumer_count)
+            sync.atomic_add(&wi.required_worker_count, task_info.thread_count)
         }
         // this brings extra deadlock safety and make sure at least one worker
         // will process the data. We only signal one because this only occurs
@@ -522,18 +524,10 @@ make_standard_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
 }
 
 @(private="file")
-compute_task_expected_worker_count :: proc(worker: ^Worker, task_info: ^TaskInfo) -> uint {
+compute_standard_task_expected_worker_count :: proc(worker: ^Worker, task_info: ^TaskInfo) -> uint {
     group := worker.group
     group_size := uint(len(group.workers))
-
-    ttl: uint
-
-    if task_info.thread_count == 1 {
-        ttl = sync.atomic_load(&group.standard_tasks_workload_info.required_worker_count)
-    } else {
-        ttl = sync.atomic_load(&group.shared_tasks_workload_info.required_worker_count)
-    }
-
+    ttl := sync.atomic_load(&group.standard_tasks_workload_info.required_worker_count)
     if ttl == 0 { return 0 }
-    return max((group_size * task_info.consumer_count * task_info.thread_count) / ttl, 1)
+    return max((group_size * task_info.thread_count) / ttl, 1)
 }

@@ -93,7 +93,6 @@ TaskKind :: enum {
 
 SharedSpace :: struct {
     barrier: Barrier,
-    thread_counter: uint,
     data: [2]Data,
     has_data: [2]bool,
 }
@@ -130,7 +129,6 @@ WorkerGroup :: struct {
     // scheduler data
     standard_tasks_workload_info: WorkloadInfo,
     shared_tasks_workload_info: WorkloadInfo,
-    parked_worker_count: uint,
     committed_shared_worker_count: uint,
     curr_shared_task_index: uint,
 }
@@ -245,14 +243,11 @@ Worker :: struct #align(CACHE_LINE) {
     local_index: uint,
     process_count: uint,
     _pad0: [CACHE_LINE]u8,
-    parked: bool,
-    _pad1: [CACHE_LINE - size_of(bool)]u8,
     can_terminate: bool,
 }
 
 worker_start :: proc(worker: ^Worker)
 {
-    sync.atomic_store(&worker.parked, true)
     sync.atomic_store(&worker.can_terminate, false)
     // TODO: we may want to experiment with the priority
     worker.thread = thread.create_and_start_with_poly_data(worker, worker_run)
@@ -269,8 +264,6 @@ worker_stop :: proc(worker: ^Worker)
 worker_run :: proc(worker: ^Worker)
 {
     for {
-        sync.atomic_store(&worker.parked, true)
-        sync.atomic_add(&worker.group.parked_worker_count, 1)
         sync.mutex_lock(&worker.group.run_mutex)
         for {
             if sync.atomic_load(&worker.can_terminate) do break
@@ -282,8 +275,6 @@ worker_run :: proc(worker: ^Worker)
         }
         sync.mutex_unlock(&worker.group.run_mutex)
         if sync.atomic_load(&worker.can_terminate) do break
-        sync.atomic_store(&worker.parked, false)
-        sync.atomic_sub(&worker.group.parked_worker_count, 1)
         process_tasks(worker)
     }
 }
@@ -437,9 +428,6 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 @(private="file")
 process_shared_tasks :: proc(worker: ^Worker)
 {
-    sync.atomic_add(&worker.group.shared_tasks_workload_info.worker_count, 1)
-    defer sync.atomic_sub(&worker.group.shared_tasks_workload_info.worker_count, 1)
-
     // TODO: we need a condition to prevent workers from entering a shared task
     //       when we know not enough workers will be available in time (could be
     //       based on the number of workers already processing a shared task)
@@ -466,8 +454,8 @@ process_shared_tasks :: proc(worker: ^Worker)
             continue
         }
 
-        if sync.atomic_add(&task_info.active_worker_count, 1) < task_info.thread_count {
-            worker.local_index = sync.atomic_add(&task_info.shared_space.thread_counter, 1)
+        worker.local_index = sync.atomic_add(&task_info.active_worker_count, 1)
+        if worker.local_index < task_info.thread_count {
             if worker.local_index == 0 {
                 sync.atomic_store(&worker.group.committed_shared_worker_count, task_info.thread_count - 1)
                 worker_group_notify_workers(worker.group, task_info.thread_count - 1)
@@ -475,12 +463,10 @@ process_shared_tasks :: proc(worker: ^Worker)
                 sync.atomic_sub(&worker.group.committed_shared_worker_count, 1)
             }
             process_shared_task(worker, task_info)
-            thread_counter := sync.atomic_sub(&task_info.shared_space.thread_counter, 1)
-            if thread_counter == 1 {
+            if sync.atomic_sub(&task_info.active_worker_count, 1) == 1 {
                 sync.atomic_store(&task_info.shared_space.barrier.state[0], 0)
                 sync.atomic_store(&task_info.shared_space.barrier.state[1], 0)
                 make_task_unready(worker.group, task_info)
-                sync.atomic_sub(&task_info.active_worker_count, task_info.thread_count)
             }
         } else {
             sync.atomic_sub(&task_info.active_worker_count, 1)

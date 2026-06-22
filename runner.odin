@@ -132,11 +132,12 @@ WorkerGroup :: struct {
     curr_shared_task_index: uint,
 }
 
-// TODO: figure out if we need some padding bettween the atomics
 WorkloadInfo :: struct #align(CACHE_LINE) {
-    required_worker_count: uint, // sum(task[i].thread_count)
-    pending_jobs_count: uint,    // number of data in all the queues
-    worker_count: uint,          // number of workers in the branch
+    required_worker_count: uint,            // sum(task[i].thread_count)
+    _pad0: [CACHE_LINE - size_of(uint)]u8,
+    pending_jobs_count: uint,               // number of data in all the queues
+    _pad1: [CACHE_LINE - size_of(uint)]u8,
+    worker_count: uint,                     // number of workers in the branch
 }
 
 worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, helper_thread_count: uint)

@@ -9,8 +9,7 @@ import "core:fmt"
 
 CACHE_LINE :: 64
 
-// TODO: test this
-MULTI_CONSUMER_SELF_BALANCE_CHECK_ITERATION_COUNT :: 1
+MULTI_CONSUMER_SELF_BALANCE_CHECK_ITERATION_COUNT :: 8
 
 // runner //////////////////////////////////////////////////////////////////////
 

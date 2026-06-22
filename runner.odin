@@ -404,6 +404,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
         //       more tasks than workers to avoid rebalancing after dequeue.
         //
         for iteration := 0; ; iteration += 1 {
+            if queue_size(&task_info.queue) == 0 do break
             sync.atomic_sub(&wi.pending_jobs_count, 1) // greedy update to reduce the chance of waking up a new worker for nothing
             data, ok := queue_pop(&task_info.queue)
             if !ok {

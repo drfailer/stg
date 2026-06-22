@@ -511,21 +511,19 @@ process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 make_task_unready :: proc(group: ^WorkerGroup, task_info: ^TaskInfo) {
     wi := &group.standard_tasks_workload_info if task_info.kind == .Standard else &group.shared_tasks_workload_info
 
-    // try to update the ready flag and the required worker count on success
+    // this avoids updating the readyness when an element just got pushed.
+    // NOTE: there is no need to wake up another worker here since the it has
+    //       already been done by the producer.
+    if queue_size(&task_info.queue) > 0 do return
+
     if sync.atomic_exchange(&task_info.is_ready, false) {
         sync.atomic_sub(&wi.required_worker_count, task_info.thread_count)
     }
-    // post check of the queue size to handle update edge cases (lock free updates)
+    // post check for race with concurrent push
     if queue_size(&task_info.queue) > 0 {
-        // we help the thread that pushed the new job by trying to make the
-        // task ready again for him
         if !sync.atomic_exchange(&task_info.is_ready, true) {
             sync.atomic_add(&wi.required_worker_count, task_info.thread_count)
         }
-        // this brings extra deadlock safety and make sure at least one worker
-        // will process the data. We only signal one because this only occurs
-        // when on job is pushed (if more jobs come after this, the thread
-        // which pushes the jobs will wake up more workers).
         sync.cond_signal(&group.run_cond)
     }
 }

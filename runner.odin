@@ -186,7 +186,7 @@ worker_group_stop :: proc(group: ^WorkerGroup)
     }
 }
 
-add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint, data : rawptr = nil)
+add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil)
 {
     ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
     ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")
@@ -195,7 +195,7 @@ add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint, d
     group.runner.tasks[procedure] = TaskInfoAndGroup{group, task_info}
 }
 
-add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint, data : rawptr = nil)
+add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil)
 {
     ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
     ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")

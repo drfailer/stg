@@ -19,28 +19,24 @@ JobTracker :: struct {
     steps: int,
 }
 
-job_tracker :: proc(step_count := 1) -> JobTracker
-{
+job_tracker :: proc(step_count := 1) -> JobTracker {
     return JobTracker{steps = step_count}
 }
 
-job_done_tracker :: proc(tracker: ^JobTracker)
-{
+job_done_tracker :: proc(tracker: ^JobTracker) {
     if sync.atomic_sub(&tracker.steps, 1) <= 1 {
         sync.cond_broadcast(&tracker.cond)
     }
 }
 
-job_done_data :: proc(data: Data)
-{
+job_done_data :: proc(data: Data) {
     ensure(data.job_tracker != nil, "called `job_done` with nil data job tracker is nil")
     job_done_tracker(data.job_tracker)
 }
 
 job_done :: proc { job_done_tracker, job_done_data }
 
-job_wait :: proc(tracker: ^JobTracker)
-{
+job_wait :: proc(tracker: ^JobTracker) {
     sync.mutex_lock(&tracker.mutex)
     for {
         if sync.atomic_load(&tracker.steps) <= 0 do break
@@ -58,23 +54,19 @@ Data :: struct {
     // pool: ^DataPool,
 }
 
-data_ptr :: proc(data: Data, $T: typeid) -> ^T
-{
+data_ptr :: proc(data: Data, $T: typeid) -> ^T {
     return cast(^T)data.ptr
 }
 
-data_type :: proc(data: Data, $T: typeid) -> T
-{
+data_type :: proc(data: Data, $T: typeid) -> T {
     return cast(T)data.type
 }
 
-make_data_with_type :: proc(type: $T, ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data
-{
+make_data_with_type :: proc(type: $T, ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data {
     return Data{int(type), ptr, job_tracker.? or_else nil}
 }
 
-make_data_no_type :: proc(ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data
-{
+make_data_no_type :: proc(ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data {
     return Data{0, ptr, job_tracker.? or_else nil}
 }
 
@@ -96,8 +88,7 @@ TaskProc :: union {
     TaskProcShared,
 }
 
-push_job_task :: proc(ctx: TaskContext, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil)
-{
+push_job_task :: proc(ctx: TaskContext, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil) {
     push_job_runner(ctx.worker.group.runner, task_proc, data, tracker)
 }
 
@@ -106,12 +97,10 @@ push_job :: proc {
     push_job_task,
 }
 
-thread_id :: proc(ctx: TaskContext) -> int
-{
+thread_id :: proc(ctx: TaskContext) -> int {
     return ctx.worker.id
 }
 
-task_data :: proc(ctx: TaskContext, $T: typeid) -> ^T
-{
+task_data :: proc(ctx: TaskContext, $T: typeid) -> ^T {
     return cast(^T)ctx.task_info.data
 }

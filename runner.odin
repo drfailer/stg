@@ -24,36 +24,31 @@ Runner :: struct {
     arena: vmem.Arena,
 }
 
-runner_init :: proc(runner: ^Runner)
-{
+runner_init :: proc(runner: ^Runner) {
     arena_error := vmem.arena_init_growing(&runner.arena)
     ensure(arena_error == nil)
     runner.worker_groups = make([dynamic]^WorkerGroup, vmem.arena_allocator(&runner.arena))
     runner.tasks = make(map[TaskProc]TaskInfoAndGroup, vmem.arena_allocator(&runner.arena))
 }
 
-runner_fini :: proc(runner: ^Runner)
-{
+runner_fini :: proc(runner: ^Runner) {
     runner_stop(runner)
     vmem.arena_destroy(&runner.arena)
 }
 
-runner_start :: proc(runner: ^Runner)
-{
+runner_start :: proc(runner: ^Runner) {
     for group in runner.worker_groups {
         worker_group_start(group)
     }
 }
 
-runner_stop :: proc(runner: ^Runner)
-{
+runner_stop :: proc(runner: ^Runner) {
     for group in runner.worker_groups {
         worker_group_fini(group)
     }
 }
 
-add_thread_group :: proc(runner: ^Runner, helper_thread_count: uint) -> ^WorkerGroup
-{
+add_thread_group :: proc(runner: ^Runner, helper_thread_count: uint) -> ^WorkerGroup {
     allocator := vmem.arena_allocator(&runner.arena)
     group := new(WorkerGroup, allocator)
     worker_group_init(Worker, group, runner, len(runner.worker_groups), helper_thread_count)
@@ -61,8 +56,7 @@ add_thread_group :: proc(runner: ^Runner, helper_thread_count: uint) -> ^WorkerG
     return group
 }
 
-push_job_runner :: proc(runner: ^Runner, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil)
-{
+push_job_runner :: proc(runner: ^Runner, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil) {
     data := data
     data.job_tracker = tracker
     task, task_exists := runner.tasks[task_proc]
@@ -96,8 +90,7 @@ SharedSpace :: struct {
     has_data: [2]bool,
 }
 
-task_info_create :: proc(kind: TaskKind, procedure: TaskProc, thread_count: uint, data: rawptr) -> ^TaskInfo
-{
+task_info_create :: proc(kind: TaskKind, procedure: TaskProc, thread_count: uint, data: rawptr) -> ^TaskInfo {
     task_info := new(TaskInfo)
     task_info.kind = kind
     task_info.procedure = procedure
@@ -107,8 +100,7 @@ task_info_create :: proc(kind: TaskKind, procedure: TaskProc, thread_count: uint
     return task_info
 }
 
-task_info_destroy :: proc(task_info: ^TaskInfo)
-{
+task_info_destroy :: proc(task_info: ^TaskInfo) {
     queue_destroy(&task_info.queue)
     free(task_info)
 }
@@ -141,8 +133,7 @@ WorkloadInfo :: struct #align(CACHE_LINE) {
 }
 
 worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, helper_thread_count: uint)
-    where W == Worker || intrinsics.type_is_subtype_of(W, Worker)
-{
+        where W == Worker || intrinsics.type_is_subtype_of(W, Worker) {
     allocator := vmem.arena_allocator(&runner.arena)
     group.id = id
     group.runner = runner
@@ -157,8 +148,7 @@ worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: 
     // TODO: we could start the group here technically
 }
 
-worker_group_fini :: proc(group: ^WorkerGroup)
-{
+worker_group_fini :: proc(group: ^WorkerGroup) {
     worker_group_stop(group)
     for task_info in group.standard_tasks_infos do task_info_destroy(task_info)
     for task_info in group.shared_tasks_infos do task_info_destroy(task_info)
@@ -166,15 +156,13 @@ worker_group_fini :: proc(group: ^WorkerGroup)
     delete(group.shared_tasks_infos)
 }
 
-worker_group_start :: proc(group: ^WorkerGroup)
-{
+worker_group_start :: proc(group: ^WorkerGroup) {
     for worker in group.workers {
         worker_start(worker)
     }
 }
 
-worker_group_stop :: proc(group: ^WorkerGroup)
-{
+worker_group_stop :: proc(group: ^WorkerGroup) {
     sync.mutex_lock(&group.run_mutex)
     for worker in group.workers {
         sync.atomic_store(&worker.can_terminate, true)
@@ -186,8 +174,7 @@ worker_group_stop :: proc(group: ^WorkerGroup)
     }
 }
 
-add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil)
-{
+add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil) {
     ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
     ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")
     task_info := task_info_create(.Standard, procedure, thread_count, data)
@@ -195,8 +182,7 @@ add_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 
     group.runner.tasks[procedure] = TaskInfoAndGroup{group, task_info}
 }
 
-add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil)
-{
+add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: uint = 1, data : rawptr = nil) {
     ensure(thread_count <= uint(len(group.workers)), "the task requires too many threads")
     ensure(procedure not_in group.runner.tasks, "cannot add the same task multiple times")
     task_info := task_info_create(.Shared, procedure, thread_count, data)
@@ -204,8 +190,7 @@ add_shared_task :: proc(group: ^WorkerGroup, procedure: TaskProc, thread_count: 
     group.runner.tasks[procedure] = TaskInfoAndGroup{group, task_info}
 }
 
-worker_group_notify_workers :: proc(group: ^WorkerGroup, count: uint)
-{
+worker_group_notify_workers :: proc(group: ^WorkerGroup, count: uint) {
     if count == 1 {
         sync.cond_signal(&group.run_cond)
     } else {
@@ -214,8 +199,7 @@ worker_group_notify_workers :: proc(group: ^WorkerGroup, count: uint)
 }
 
 @(private="file")
-worker_group_account_jobs :: proc(group: ^WorkerGroup, task_info: ^TaskInfo, jobs_count: uint)
-{
+worker_group_account_jobs :: proc(group: ^WorkerGroup, task_info: ^TaskInfo, jobs_count: uint) {
     if jobs_count == 0 do return
     wi := &group.standard_tasks_workload_info if task_info.kind == .Standard else &group.shared_tasks_workload_info
 
@@ -246,23 +230,20 @@ Worker :: struct #align(CACHE_LINE) {
     can_terminate: bool,
 }
 
-worker_start :: proc(worker: ^Worker)
-{
+worker_start :: proc(worker: ^Worker) {
     sync.atomic_store(&worker.can_terminate, false)
     // TODO: we may want to experiment with the priority
     worker.thread = thread.create_and_start_with_poly_data(worker, worker_run, init_context = context)
 }
 
-worker_stop :: proc(worker: ^Worker)
-{
+worker_stop :: proc(worker: ^Worker) {
     if worker.thread != nil {
         thread.destroy(worker.thread)
         worker.thread = nil
     }
 }
 
-worker_run :: proc(worker: ^Worker)
-{
+worker_run :: proc(worker: ^Worker) {
     for {
         sync.mutex_lock(&worker.group.run_mutex)
         for {
@@ -280,8 +261,7 @@ worker_run :: proc(worker: ^Worker)
 }
 
 @(private="file")
-process_tasks :: proc(worker: ^Worker)
-{
+process_tasks :: proc(worker: ^Worker) {
     group := worker.group
     standard_task_required_worker_count := sync.atomic_load(&group.standard_tasks_workload_info.required_worker_count)
     shared_task_required_worker_count := sync.atomic_load(&group.shared_tasks_workload_info.required_worker_count)
@@ -310,8 +290,7 @@ process_tasks :: proc(worker: ^Worker)
     }
 }
 
-process_standard_tasks :: proc(worker: ^Worker)
-{
+process_standard_tasks :: proc(worker: ^Worker) {
     sync.atomic_add(&worker.group.standard_tasks_workload_info.worker_count, 1)
     defer sync.atomic_sub(&worker.group.standard_tasks_workload_info.worker_count, 1)
 
@@ -366,8 +345,7 @@ process_standard_tasks :: proc(worker: ^Worker)
 }
 
 @(private="file")
-process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
-{
+process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
     group := worker.group
     ctx := TaskContext{worker, task_info, {}}
     wi := &group.standard_tasks_workload_info
@@ -427,8 +405,7 @@ process_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
 }
 
 @(private="file")
-process_shared_tasks :: proc(worker: ^Worker)
-{
+process_shared_tasks :: proc(worker: ^Worker) {
     // TODO: we need a condition to prevent workers from entering a shared task
     //       when we know not enough workers will be available in time (could be
     //       based on the number of workers already processing a shared task)
@@ -479,8 +456,7 @@ process_shared_tasks :: proc(worker: ^Worker)
 }
 
 @(private="file")
-process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo)
-{
+process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
     assert(queue_size(&task_info.queue) > 0)
     ctx := TaskContext{worker, task_info, &task_info.shared_space}
     barrier_state_index: u8

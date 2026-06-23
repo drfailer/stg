@@ -12,8 +12,7 @@ Barrier :: struct {
     mutex: sync.Atomic_Mutex,
 }
 
-unpack_state :: proc(state: u32) -> (thread_counter: u32, done, canceled: bool)
-{
+unpack_state :: proc(state: u32) -> (thread_counter: u32, done, canceled: bool) {
     thread_counter = state & THREAD_COUNTER_MASK
     done = (state & DONE_BIT_MASK) != 0
     canceled = (state & CANCELED_BIT_MASK) != 0
@@ -21,8 +20,7 @@ unpack_state :: proc(state: u32) -> (thread_counter: u32, done, canceled: bool)
 }
 
 // should return false when canceled
-barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (success: bool)
-{
+barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (success: bool) {
     assert(count <= THREAD_COUNTER_MASK)
     defer {
         // INVARIANT: the next state is ready for use
@@ -52,8 +50,7 @@ barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (succes
     return true
 }
 
-barrier_cancel :: proc(barrier: ^Barrier, state_index: ^u8)
-{
+barrier_cancel :: proc(barrier: ^Barrier, state_index: ^u8) {
     defer {
         // INVARIANT: the next state is ready for use
         state_index^ = (state_index^ + 1) & 1

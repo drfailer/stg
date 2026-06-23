@@ -88,3 +88,8 @@ thread_id :: proc(ctx: TaskContext) -> int
 {
     return ctx.worker.id
 }
+
+task_data :: proc(ctx: TaskContext, $T: typeid) -> ^T
+{
+    return cast(^T)ctx.task_info.data
+}

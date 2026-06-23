@@ -250,7 +250,7 @@ worker_start :: proc(worker: ^Worker)
 {
     sync.atomic_store(&worker.can_terminate, false)
     // TODO: we may want to experiment with the priority
-    worker.thread = thread.create_and_start_with_poly_data(worker, worker_run)
+    worker.thread = thread.create_and_start_with_poly_data(worker, worker_run, init_context = context)
 }
 
 worker_stop :: proc(worker: ^Worker)

@@ -48,7 +48,7 @@ job_wait :: proc(tracker: ^JobTracker) {
 // data ////////////////////////////////////////////////////////////////////////
 
 Data :: struct {
-    type: int,
+    type: typeid,
     ptr: rawptr,
     job_tracker: ^JobTracker,
     // pool: ^DataPool,
@@ -58,19 +58,13 @@ data_ptr :: proc(data: Data, $T: typeid) -> ^T {
     return cast(^T)data.ptr
 }
 
-data_type :: proc(data: Data, $T: typeid) -> T {
-    return cast(T)data.type
+data_type :: proc(data: Data) -> typeid {
+    return data.type
 }
 
-make_data_with_type :: proc(type: $T, ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data {
-    return Data{int(type), ptr, job_tracker.? or_else nil}
+make_data :: proc(ptr: ^$T, job_tracker: Maybe(^JobTracker) = nil) -> Data {
+    return Data{T, ptr, job_tracker.? or_else nil}
 }
-
-make_data_no_type :: proc(ptr: rawptr, job_tracker: Maybe(^JobTracker) = nil) -> Data {
-    return Data{0, ptr, job_tracker.? or_else nil}
-}
-
-make_data :: proc{ make_data_with_type, make_data_no_type }
 
 // tasks ///////////////////////////////////////////////////////////////////////
 

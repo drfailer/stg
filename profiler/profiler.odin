@@ -45,6 +45,8 @@ GlobalProfileEntry :: struct {
 
 // init ////////////////////////////////////////////////////////////////////////
 
+when PROFILER_ENABLED {
+
 init :: proc() {
     GLOBAL_PROFILERS.profilers = make(map[int]^Profiler)
     GLOBAL_PROFILERS.global_entries = make(map[string]GlobalProfileEntry)
@@ -72,6 +74,8 @@ start :: proc() {
 }
 
 stop :: proc() {
+    if !GLOBAL_PROFILERS.started do return
+
     time.stopwatch_stop(&GLOBAL_PROFILERS.stopwatch)
     GLOBAL_PROFILERS.started = false
 
@@ -113,11 +117,25 @@ register :: proc() {
 
 }
 
+} else {
+
+init :: proc() {}
+fini :: proc() {}
+
+start :: proc() {}
+stop :: proc() {}
+
+register :: proc() {}
+
+}
+
 // region //////////////////////////////////////////////////////////////////////
 
 //
 // profile a specific region of the code
 //
+
+when PROFILER_ENABLED {
 
 region_begin :: proc(name: string) {
     profiler := get_profiler()
@@ -182,6 +200,17 @@ procedure :: proc(loc := #caller_location) {
     region_begin(loc.procedure)
 }
 
+} else {
+
+region_begin :: proc(name: string) {}
+region_end :: proc(name: string) {}
+region :: proc(name: string) -> bool { return true }
+
+procedure_end :: proc(loc := #caller_location) {}
+procedure :: proc(loc := #caller_location) {}
+
+}
+
 // report //////////////////////////////////////////////////////////////////////
 
 ReportFormat :: enum {
@@ -191,8 +220,16 @@ ReportFormat :: enum {
     // json?
 }
 
+when PROFILER_ENABLED {
+
+// should only be called by the main thread
+print_report :: proc() {
+    generate_text_report(os.stdout)
+}
+
 generate_report :: proc(filename: string, format := ReportFormat.Text) {
-    file, err := os.open(filename, {.Write, .Create})
+    _ = os.remove(filename) // open does not recreate the file
+    file, err := os.open(filename, {.Write, .Create}, {.Read_Other, .Write_Group, .Read_Other, .Write_User, .Read_User})
     ensure(err == nil, "failed to open file")
     switch format {
     case .Text: generate_text_report(file)
@@ -200,6 +237,7 @@ generate_report :: proc(filename: string, format := ReportFormat.Text) {
     }
 }
 
+@(private="file")
 generate_text_report :: proc(file: ^os.File) {
     global_ttl := time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
 
@@ -256,6 +294,7 @@ generate_text_report :: proc(file: ^os.File) {
     fmt.fprintfln(file, "Profiler total time: {}", ttl_time_str)
 }
 
+@(private="file")
 generate_dot_report :: proc(file: ^os.File) {
     global_ttl := time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
     ttl_time_str := duration_to_string(global_ttl)
@@ -295,31 +334,11 @@ generate_dot_report :: proc(file: ^os.File) {
     fmt.fprintfln(file, "}")
 }
 
-// should only be called by the main thread
-print_report :: proc() {
-    generate_text_report(os.stdout)
-}
+} else {
 
-duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {
-    ns := time.duration_nanoseconds(dur)
-    if ns < 0 { ns = 0 }
+print_report :: proc() {}
+generate_report :: proc(filename: string, format := ReportFormat.Text) {}
 
-    s := ns / 1_000_000_000
-    ms := ns / 1_000_000
-    us := ns / 1_000
-
-    if s > 0 {
-        remainder_ms := (ns - s * 1_000_000_000) / 1_000_000
-        return fmt.aprintf("%d.%03ds", s, remainder_ms, allocator = allocator)
-    } else if ms > 0 {
-        remainder_us := (ns - ms * 1_000_000) / 1_000
-        return fmt.aprintf("%d.%03dms", ms, remainder_us, allocator = allocator)
-    } else if us > 0 {
-        remainder_ns := ns - us * 1_000
-        return fmt.aprintf("%d.%03dus", us, remainder_ns, allocator = allocator)
-    } else {
-        return fmt.aprintf("%dns", ns, allocator = allocator)
-    }
 }
 
 // internals ///////////////////////////////////////////////////////////////////
@@ -345,4 +364,27 @@ map_get_ptr :: proc(m: ^map[$K]$V, key: K) -> ^V {
         value_ptr = &m[key]
     }
     return value_ptr
+}
+
+@(private="file")
+duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {
+    ns := time.duration_nanoseconds(dur)
+    if ns < 0 { ns = 0 }
+
+    s := ns / 1_000_000_000
+    ms := ns / 1_000_000
+    us := ns / 1_000
+
+    if s > 0 {
+        remainder_ms := (ns - s * 1_000_000_000) / 1_000_000
+        return fmt.aprintf("%d.%03ds", s, remainder_ms, allocator = allocator)
+    } else if ms > 0 {
+        remainder_us := (ns - ms * 1_000_000) / 1_000
+        return fmt.aprintf("%d.%03dms", ms, remainder_us, allocator = allocator)
+    } else if us > 0 {
+        remainder_ns := ns - us * 1_000
+        return fmt.aprintf("%d.%03dus", us, remainder_ns, allocator = allocator)
+    } else {
+        return fmt.aprintf("%dns", ns, allocator = allocator)
+    }
 }

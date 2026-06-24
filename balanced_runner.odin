@@ -41,7 +41,6 @@ runner_init :: proc(runner: ^Runner) {
 runner_fini :: proc(runner: ^Runner) {
     runner_stop(runner)
     vmem.arena_destroy(&runner.arena)
-    prof.print_report()
     prof.fini()
 }
 

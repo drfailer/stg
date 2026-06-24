@@ -438,8 +438,8 @@ duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -
 }
 
 main :: proc() {
-    MATRIX_SIZE :: 1024
-    TILE_SIZE :: 256
+    MATRIX_SIZE :: 10000
+    TILE_SIZE :: 1024
 
     logger := log.create_console_logger(.Error, {.Level, .Short_File_Path, .Line, .Procedure, .Terminal_Color, .Thread_Id})
     defer log.destroy_console_logger(logger)
@@ -466,4 +466,6 @@ main :: proc() {
     dur := duration_to_string(time.stopwatch_duration(sw))
     defer delete(dur)
     fmt.printfln("stg_dgemm: {}", dur)
+
+    prof.generate_report("report.dot", .Dot)
 }

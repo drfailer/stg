@@ -10,6 +10,7 @@ import "core:container/queue"
 import "core:mem"
 import vmem "core:mem/virtual"
 import "../../"
+import prof "../../profiler"
 
 ftype :: f64
 
@@ -57,6 +58,7 @@ alloc_matrix_tile :: proc(pool: ^stg.MultiPool, type: typeid) -> ^MatrixTile {
 }
 
 split_matrix_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
+    prof.procedure()
     self := stg.task_data(ctx, SplitMatrixTaskData)
 
     m := stg.data_ptr(data, Matrix)
@@ -101,6 +103,7 @@ ProductStateData :: struct {
 }
 
 product_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
+    prof.procedure()
     self := stg.task_data(ctx, ProductStateData)
     tile := stg.data_ptr(data, MatrixTile)
     tid := stg.data_type(data)
@@ -142,6 +145,7 @@ product_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
 }
 
 product_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
+    prof.procedure()
     tiles := stg.data_ptr(data, ProductData)
     log.debugf("product received, P[{}, {}] = A[{}, {}] * B[{}, {}]",
         tiles.p.row, tiles.p.col, tiles.a.row, tiles.a.col, tiles.b.row, tiles.b.col)
@@ -174,6 +178,7 @@ SumStateData :: struct {
 }
 
 sum_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
+    prof.procedure()
     self := stg.task_data(ctx, SumStateData)
     tid := stg.data_type(data)
 
@@ -236,6 +241,7 @@ sum_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
 }
 
 sum_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
+    prof.procedure()
     tiles := stg.data_ptr(data, SumData)
     log.debugf("sum task received data: C[{}, {}] (@{})", tiles.c.row, tiles.c.col, uintptr(tiles))
 
@@ -251,6 +257,11 @@ sum_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
 
 // C[MxN] = A[MxK] * B[KxN]
 stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
+    runner: stg.Runner
+    stg.runner_init(&runner)
+    defer stg.runner_fini(&runner)
+    prof.procedure()
+
     A := cast(MatrixA)A
     B := cast(MatrixB)B
     C := cast(MatrixC)C
@@ -283,10 +294,6 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     ensure(arena_err == nil, "failed to initialize virtual arena")
     defer vmem.arena_destroy(&arena)
     allocator := vmem.arena_allocator(&arena)
-
-    runner: stg.Runner
-    stg.runner_init(&runner)
-    defer stg.runner_fini(&runner)
 
     split_matrix_task_data := SplitMatrixTaskData{tile_size, &data_pool}
     product_state_data := ProductStateData{make([dynamic]^MatrixTileA, TM * TK, allocator = allocator),
@@ -431,8 +438,8 @@ duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -
 }
 
 main :: proc() {
-    MATRIX_SIZE :: 10000
-    TILE_SIZE :: 1024
+    MATRIX_SIZE :: 1024
+    TILE_SIZE :: 256
 
     logger := log.create_console_logger(.Error, {.Level, .Short_File_Path, .Line, .Procedure, .Terminal_Color, .Thread_Id})
     defer log.destroy_console_logger(logger)

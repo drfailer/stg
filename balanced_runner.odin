@@ -7,6 +7,11 @@ import "base:intrinsics"
 import "core:container/queue"
 import "core:fmt"
 
+import prof "profiler"
+
+// TODO: I would like to try a version without balancing (the workers continue to process a task untill the queue is empty)
+// TODO: rename the struct here
+
 CACHE_LINE :: 64
 
 MULTI_CONSUMER_SELF_BALANCE_CHECK_ITERATION_COUNT :: 8
@@ -25,6 +30,8 @@ Runner :: struct {
 }
 
 runner_init :: proc(runner: ^Runner) {
+    prof.init()
+    prof.register() // register the main thread
     arena_error := vmem.arena_init_growing(&runner.arena)
     ensure(arena_error == nil)
     runner.worker_groups = make([dynamic]^WorkerGroup, vmem.arena_allocator(&runner.arena))
@@ -34,9 +41,12 @@ runner_init :: proc(runner: ^Runner) {
 runner_fini :: proc(runner: ^Runner) {
     runner_stop(runner)
     vmem.arena_destroy(&runner.arena)
+    prof.print_report()
+    prof.fini()
 }
 
 runner_start :: proc(runner: ^Runner) {
+    prof.start()
     for group in runner.worker_groups {
         worker_group_start(group)
     }
@@ -46,6 +56,8 @@ runner_stop :: proc(runner: ^Runner) {
     for group in runner.worker_groups {
         worker_group_fini(group)
     }
+    clear(&runner.worker_groups)
+    prof.stop()
 }
 
 add_thread_group :: proc(runner: ^Runner, helper_thread_count: uint) -> ^WorkerGroup {
@@ -114,6 +126,7 @@ WorkerGroup :: struct {
     workers: [dynamic]^Worker,
     run_mutex: sync.Mutex,
     run_cond: sync.Cond,
+    init_barrier: sync.Barrier,
     // tasks
     standard_tasks_infos: [dynamic]^TaskInfo,
     shared_tasks_infos: [dynamic]^TaskInfo,
@@ -132,19 +145,20 @@ WorkloadInfo :: struct #align(CACHE_LINE) {
     worker_count: uint,                     // number of workers in the branch
 }
 
-worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, helper_thread_count: uint)
+worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: int, thread_count: uint)
         where W == Worker || intrinsics.type_is_subtype_of(W, Worker) {
     allocator := vmem.arena_allocator(&runner.arena)
     group.id = id
     group.runner = runner
-    group.workers = make([dynamic]^Worker, helper_thread_count, allocator)
-    for i in 0..<helper_thread_count {
+    group.workers = make([dynamic]^Worker, thread_count, allocator)
+    for i in 0..<thread_count {
         group.workers[i] = new(W, allocator)
         group.workers[i].group = group
         group.workers[i].id = int(i)
     }
     group.standard_tasks_infos = make([dynamic]^TaskInfo)
     group.shared_tasks_infos = make([dynamic]^TaskInfo)
+    sync.barrier_init(&group.init_barrier, int(thread_count))
     // TODO: we could start the group here technically
 }
 
@@ -244,9 +258,13 @@ worker_stop :: proc(worker: ^Worker) {
 }
 
 worker_run :: proc(worker: ^Worker) {
+    prof.register()
+    sync.barrier_wait(&worker.group.init_barrier) // required for the profiler
+    prof.procedure()
     for {
         sync.mutex_lock(&worker.group.run_mutex)
         for {
+            prof.region("worker_sleep")
             if sync.atomic_load(&worker.can_terminate) do break
             if sync.atomic_load(&worker.group.standard_tasks_workload_info.pending_jobs_count) > 0 do break
             if sync.atomic_load(&worker.group.shared_tasks_workload_info.pending_jobs_count) > 0 do break
@@ -256,7 +274,9 @@ worker_run :: proc(worker: ^Worker) {
         }
         sync.mutex_unlock(&worker.group.run_mutex)
         if sync.atomic_load(&worker.can_terminate) do break
+        prof.region_begin("worker_process")
         process_tasks(worker)
+        prof.region_end("worker_process")
     }
 }
 

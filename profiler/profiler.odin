@@ -3,6 +3,7 @@ package profiler
 import "core:fmt"
 import "core:time"
 import "core:sync"
+import "core:os"
 import "core:container/small_array"
 
 PROFILER_ENABLED :: #config(PROFILER_ENABLED, true)
@@ -79,8 +80,8 @@ stop :: proc() {
         for entry_name, entry in profiler.entries {
             global_entry := map_get_ptr(&GLOBAL_PROFILERS.global_entries, entry_name)
             for parent_name, parent_info in entry.parents {
-                parent_info := map_get_ptr(&global_entry.parents, parent_name)
-                parent_info.call_count += parent_info.call_count
+                global_parent_info := map_get_ptr(&global_entry.parents, parent_name)
+                global_parent_info.call_count += parent_info.call_count
             }
             global_entry.min = min(entry.min, global_entry.min) if global_entry.min > 0 else entry.min
             global_entry.max = max(entry.max, global_entry.max)
@@ -191,15 +192,19 @@ ReportFormat :: enum {
 }
 
 generate_report :: proc(filename: string, format := ReportFormat.Text) {
-    panic("unimplemented")
+    file, err := os.open(filename, {.Write, .Create})
+    ensure(err == nil, "failed to open file")
+    switch format {
+    case .Text: generate_text_report(file)
+    case .Dot: generate_dot_report(file)
+    }
 }
 
-// should only be called by the main thread
-print_report :: proc() {
+generate_text_report :: proc(file: ^os.File) {
     global_ttl := time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
 
     for thread_id, profiler in GLOBAL_PROFILERS.profilers {
-        fmt.printfln("Profile of thread `{}` (profiler = {}):", thread_id, uintptr(profiler))
+        fmt.fprintfln(file, "Profile of thread `{}` (profiler = {}):", thread_id, uintptr(profiler))
         for entry_name, entry in profiler.entries {
             str_ttl := duration_to_string(entry.ttl, context.temp_allocator)
             avg := time.Duration(f64(entry.ttl) / f64(entry.count))
@@ -207,7 +212,7 @@ print_report :: proc() {
             str_min := duration_to_string(entry.min, context.temp_allocator)
             str_max := duration_to_string(entry.max, context.temp_allocator)
             percent := 100 * (f64(entry.ttl) / f64(global_ttl))
-            fmt.printfln("- {}: avg = {} [{}-{}] / ttl = {}, count = {} ({}%%)",
+            fmt.fprintfln(file, "- {}: avg = {} [{}-{}] / ttl = {}, count = {} ({:.3f}%%)",
                 entry_name, str_avg, str_min, str_max, str_ttl, entry.count, percent)
 
             // print parent infos
@@ -216,7 +221,7 @@ print_report :: proc() {
                 parent_ttl := parent_entry.ttl if parent_found else time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
                 parent_str_ttl := duration_to_string(parent_ttl, context.temp_allocator)
                 percent := 100 * (f64(entry.ttl) / f64(parent_ttl))
-                fmt.printfln("  - parent {}(calls = {}): child ttl = {} / parent ttl = {} ({}%%)",
+                fmt.fprintfln(file, "  - parent {}(calls = {}): child ttl = {} / parent ttl = {} ({:.3f}%%)",
                     parent_name, parent_info.call_count, str_ttl, parent_str_ttl, percent)
             }
 
@@ -225,7 +230,7 @@ print_report :: proc() {
         }
     }
 
-    fmt.println("Global entries accross all threads:")
+    fmt.fprintln(file, "Global entries accross all threads:")
     for entry_name, entry in GLOBAL_PROFILERS.global_entries {
         avg := time.Duration(f64(entry.ttl) / f64(entry.count))
         str_avg := duration_to_string(avg, context.temp_allocator)
@@ -234,7 +239,7 @@ print_report :: proc() {
         str_ttl := duration_to_string(entry.ttl, context.temp_allocator)
         ttl_avg := f64(entry.ttl) / f64(entry.thread_count)
         percent := 100 * (ttl_avg / f64(global_ttl))
-        fmt.printfln("- {}: avg = {} [{}-{}] / ttl = {}, count = {}, threads = {}, ({}%%)",
+        fmt.fprintfln(file, "- {}: avg = {} [{}-{}] / ttl = {}, count = {}, threads = {}, ({:.3f}%%)",
             entry_name, str_avg, str_min, str_max, str_ttl, entry.count, entry.thread_count, percent)
 
         for parent_name, parent_info in entry.parents {
@@ -242,13 +247,57 @@ print_report :: proc() {
             parent_ttl := parent_entry.ttl if parent_found else time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
             parent_str_ttl := duration_to_string(parent_ttl, context.temp_allocator)
             percent := 100 * (f64(entry.ttl) / f64(parent_ttl))
-            fmt.printfln("  - parent {}(calls = {}): child ttl = {} / parent ttl = {} ({}%%)", parent_name, parent_info.call_count,
+            fmt.fprintfln(file, "  - parent {}(calls = {}): child ttl = {} / parent ttl = {} ({:.3f}%%)", parent_name, parent_info.call_count,
                 str_ttl, parent_str_ttl, percent)
         }
     }
     ttl_time_str := duration_to_string(global_ttl)
     defer delete(ttl_time_str)
-    fmt.printfln("Profiler total time: {}", ttl_time_str)
+    fmt.fprintfln(file, "Profiler total time: {}", ttl_time_str)
+}
+
+generate_dot_report :: proc(file: ^os.File) {
+    global_ttl := time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
+    ttl_time_str := duration_to_string(global_ttl)
+    defer delete(ttl_time_str)
+
+    fmt.fprintln(file, "digraph Program_Execution {")
+    fmt.fprintfln(file, "label=\"execution time = {}\";", ttl_time_str)
+
+    // set the src entry
+    fmt.fprintfln(file, "src [label=\"src ({})\",shape=rectangle];", ttl_time_str)
+
+    for entry_name, entry in GLOBAL_PROFILERS.global_entries {
+        avg := time.Duration(f64(entry.ttl) / f64(entry.count))
+        str_avg := duration_to_string(avg, context.temp_allocator)
+        str_min := duration_to_string(entry.min, context.temp_allocator)
+        str_max := duration_to_string(entry.max, context.temp_allocator)
+        str_ttl := duration_to_string(entry.ttl, context.temp_allocator)
+        ttl_avg := f64(entry.ttl) / f64(entry.thread_count)
+        ratio   := ttl_avg / f64(global_ttl)
+        percent := 100 * ratio
+        // determin the node colors
+        red := u8(255 * ratio)
+        green := u8(1 - 2 * abs(ratio - 0.5))
+        blue := u8(255 * (1 - ratio))
+
+        fmt.fprintfln(file, "{} [label=\"{}\\navg = {}, min = {}, max = {}\\nttl = {}, count = {}\\nnumber of threads = {}\\n{:.3f}%%\",shape=rectangle,color=\"#%2X%2X%2X\",penwidth=2];",
+            entry_name, entry_name, str_avg, str_min, str_max, str_ttl, entry.count, entry.thread_count, percent, red, green, blue)
+
+        for parent_name, parent_info in entry.parents {
+            parent_entry, parent_found := &GLOBAL_PROFILERS.global_entries[parent_name]
+            parent_ttl := parent_entry.ttl if parent_found else time.stopwatch_duration(GLOBAL_PROFILERS.stopwatch)
+            percent := 100 * (f64(entry.ttl) / f64(parent_ttl))
+            fmt.fprintfln(file, "{} -> {} [label=\"x {} / {:.3f}%%\"];",
+                parent_name, entry_name, parent_info.call_count, percent)
+        }
+    }
+    fmt.fprintfln(file, "}")
+}
+
+// should only be called by the main thread
+print_report :: proc() {
+    generate_text_report(os.stdout)
 }
 
 duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {

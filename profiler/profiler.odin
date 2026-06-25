@@ -7,7 +7,8 @@ import "core:os"
 import "core:container/small_array"
 
 PROFILER_ENABLED :: #config(PROFILER_ENABLED, true)
-MAX_ENTRY_STACK :: #config(MAX_ENTRY_STACK, 64)
+PROF_ALLOW_LATE_REGISTRATION :: #config(PROF_ALLOW_LATE_REGISTRATION, false)
+PROF_MAX_ENTRY_STACK :: #config(PROF_MAX_ENTRY_STACK, 64)
 
 GLOBAL_PROFILERS := Profilers{}
 
@@ -16,12 +17,13 @@ Profilers :: struct {
     global_entries: map[string]GlobalProfileEntry,
     mutex: sync.Mutex,
     stopwatch: time.Stopwatch,
+    inited: bool,
     started: bool,
 }
 
 Profiler :: struct {
     entries: map[string]ProfileEntry,
-    entry_stack: small_array.Small_Array(MAX_ENTRY_STACK, string),
+    entry_stack: small_array.Small_Array(PROF_MAX_ENTRY_STACK, string),
     entry_stack_overflow_counter: uint,
 }
 
@@ -48,11 +50,16 @@ GlobalProfileEntry :: struct {
 when PROFILER_ENABLED {
 
 init :: proc() {
+    if GLOBAL_PROFILERS.inited do return
+
     GLOBAL_PROFILERS.profilers = make(map[int]^Profiler)
     GLOBAL_PROFILERS.global_entries = make(map[string]GlobalProfileEntry)
+    GLOBAL_PROFILERS.inited = true
 }
 
 fini :: proc() {
+    if !GLOBAL_PROFILERS.inited do return
+
     time.stopwatch_stop(&GLOBAL_PROFILERS.stopwatch)
     for _, &profiler in GLOBAL_PROFILERS.profilers {
         for _, &entry in profiler.entries {
@@ -66,9 +73,11 @@ fini :: proc() {
         delete(entry.parents)
     }
     delete(GLOBAL_PROFILERS.global_entries)
+    GLOBAL_PROFILERS.inited = false
 }
 
 start :: proc() {
+    if GLOBAL_PROFILERS.started do return
     time.stopwatch_start(&GLOBAL_PROFILERS.stopwatch)
     GLOBAL_PROFILERS.started = true
 }
@@ -107,7 +116,11 @@ register :: proc() {
     sync.lock(&GLOBAL_PROFILERS.mutex)
     defer sync.unlock(&GLOBAL_PROFILERS.mutex)
 
-    // assert(GLOBAL_PROFILERS.started == false)
+    when !PROF_ALLOW_LATE_REGISTRATION {
+        // note: we use an assert here because we might not test this all the time
+        assert(GLOBAL_PROFILERS.started == false, "cannot register a new thread when the profiling is started")
+    }
+
     thread_id := sync.current_thread_id()
     ensure(thread_id not_in GLOBAL_PROFILERS.profilers, "cannot register the same thread twice")
     profiler := new(Profiler)
@@ -345,10 +358,13 @@ generate_report :: proc(filename: string, format := ReportFormat.Text) {}
 
 @(private="file")
 get_profiler :: proc() -> ^Profiler {
-    // we shouldn't have to lock ere if the profilers are registered before the
-    // threads start profiling
-    // sync.lock(&GLOBAL_PROFILERS.mutex)
-    // defer sync.unlock(&GLOBAL_PROFILERS.mutex)
+    when PROF_ALLOW_LATE_REGISTRATION {
+        // when late registration is allowed, the profilier map can be modified
+        // during the profiling so we need to lock. Otherwise, the memory will
+        // not change so concurent read access is allowed without lock.
+        sync.lock(&GLOBAL_PROFILERS.mutex)
+        defer sync.unlock(&GLOBAL_PROFILERS.mutex)
+    }
 
     thread_id := sync.current_thread_id()
     profiler, ok := GLOBAL_PROFILERS.profilers[thread_id]

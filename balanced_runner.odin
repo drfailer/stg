@@ -45,10 +45,16 @@ runner_fini :: proc(runner: ^Runner) {
 }
 
 runner_start :: proc(runner: ^Runner) {
-    prof.start()
+    ttl_thread_count := 0
     for group in runner.worker_groups {
-        worker_group_start(group)
+        ttl_thread_count += len(group.workers)
     }
+    start_job := job_tracker(ttl_thread_count)
+    for group in runner.worker_groups {
+        worker_group_start(group, &start_job)
+    }
+    job_wait(&start_job)
+    prof.start() // we start the profiling when all the threads are registered
 }
 
 runner_stop :: proc(runner: ^Runner) {
@@ -125,7 +131,6 @@ WorkerGroup :: struct {
     workers: [dynamic]^Worker,
     run_mutex: sync.Mutex,
     run_cond: sync.Cond,
-    init_barrier: sync.Barrier,
     // tasks
     standard_tasks_infos: [dynamic]^TaskInfo,
     shared_tasks_infos: [dynamic]^TaskInfo,
@@ -157,7 +162,6 @@ worker_group_init :: proc($W: typeid, group: ^WorkerGroup, runner: ^Runner, id: 
     }
     group.standard_tasks_infos = make([dynamic]^TaskInfo)
     group.shared_tasks_infos = make([dynamic]^TaskInfo)
-    sync.barrier_init(&group.init_barrier, int(thread_count))
     // TODO: we could start the group here technically
 }
 
@@ -169,9 +173,9 @@ worker_group_fini :: proc(group: ^WorkerGroup) {
     delete(group.shared_tasks_infos)
 }
 
-worker_group_start :: proc(group: ^WorkerGroup) {
+worker_group_start :: proc(group: ^WorkerGroup, start_job: ^JobTracker) {
     for worker in group.workers {
-        worker_start(worker)
+        worker_start(worker, start_job)
     }
 }
 
@@ -243,10 +247,10 @@ Worker :: struct #align(CACHE_LINE) {
     can_terminate: bool,
 }
 
-worker_start :: proc(worker: ^Worker) {
+worker_start :: proc(worker: ^Worker, start_job: ^JobTracker) {
     sync.atomic_store(&worker.can_terminate, false)
     // TODO: we may want to experiment with the priority
-    worker.thread = thread.create_and_start_with_poly_data(worker, worker_run, init_context = context)
+    worker.thread = thread.create_and_start_with_poly_data2(worker, start_job, worker_run, init_context = context)
 }
 
 worker_stop :: proc(worker: ^Worker) {
@@ -256,9 +260,11 @@ worker_stop :: proc(worker: ^Worker) {
     }
 }
 
-worker_run :: proc(worker: ^Worker) {
+worker_run :: proc(worker: ^Worker, start_job: ^JobTracker) {
     prof.register()
-    sync.barrier_wait(&worker.group.init_barrier) // required for the profiler
+    job_done(start_job) // notify that this worker is started
+    job_wait(start_job) // wait for all the rest of the threads to start
+
     prof.procedure()
     for {
         sync.mutex_lock(&worker.group.run_mutex)

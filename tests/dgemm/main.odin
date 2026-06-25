@@ -260,7 +260,7 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     runner: stg.Runner
     stg.runner_init(&runner)
     defer stg.runner_fini(&runner)
-    prof.procedure()
+    prof.procedure() // nobody is registering so this is allowed
 
     A := cast(MatrixA)A
     B := cast(MatrixB)B

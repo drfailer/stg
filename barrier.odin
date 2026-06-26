@@ -3,11 +3,13 @@ package stg
 import "core:sync"
 import "base:intrinsics"
 
+// cancelable barrier //////////////////////////////////////////////////////////
+
 DONE_BIT_MASK :: u32(1 << 31)
 CANCELED_BIT_MASK :: u32(1 << 30)
 THREAD_COUNTER_MASK :: ~(DONE_BIT_MASK | CANCELED_BIT_MASK)
 
-Barrier :: struct {
+CancelBarrier :: struct {
     state: [2]u32,
     mutex: sync.Atomic_Mutex,
 }
@@ -20,7 +22,7 @@ unpack_state :: proc(state: u32) -> (thread_counter: u32, done, canceled: bool) 
 }
 
 // should return false when canceled
-barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (success: bool) {
+cancel_barrier_wait :: proc(barrier: ^CancelBarrier, state_index: ^u8, count: u32) -> (success: bool) {
     assert(count <= THREAD_COUNTER_MASK)
     defer {
         // INVARIANT: the next state is ready for use
@@ -50,7 +52,7 @@ barrier_wait :: proc(barrier: ^Barrier, state_index: ^u8, count: u32) -> (succes
     return true
 }
 
-barrier_cancel :: proc(barrier: ^Barrier, state_index: ^u8) {
+cancel_barrier_cancel :: proc(barrier: ^CancelBarrier, state_index: ^u8) {
     defer {
         // INVARIANT: the next state is ready for use
         state_index^ = (state_index^ + 1) & 1
@@ -67,3 +69,19 @@ barrier_cancel :: proc(barrier: ^Barrier, state_index: ^u8) {
     }
 }
 
+// spin barrier ////////////////////////////////////////////////////////////////
+
+SpinBarrier :: struct {
+    counter: uint,
+}
+
+spin_barrier_wait :: proc(barrier: ^SpinBarrier, count: uint) {
+    if sync.atomic_add(&barrier.counter, 1) == count - 1 {
+        sync.atomic_store(&barrier.counter, 0)
+        return
+    }
+    for {
+        if sync.atomic_load(&barrier.counter) == 0 do break
+        intrinsics.cpu_relax()
+    }
+}

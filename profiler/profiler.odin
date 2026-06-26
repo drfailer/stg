@@ -7,7 +7,7 @@ import "core:os"
 import "core:container/small_array"
 
 PROFILER_ENABLED :: #config(PROFILER_ENABLED, true)
-PROF_ALLOW_LATE_REGISTRATION :: #config(PROF_ALLOW_LATE_REGISTRATION, false)
+PROF_ALLOW_LATE_REGISTRATION :: #config(PROF_ALLOW_LATE_REGISTRATION, true)
 PROF_MAX_ENTRY_STACK :: #config(PROF_MAX_ENTRY_STACK, 64)
 
 GLOBAL_PROFILERS := Profilers{}
@@ -77,12 +77,14 @@ fini :: proc() {
 }
 
 start :: proc() {
+    if !GLOBAL_PROFILERS.inited do return
     if GLOBAL_PROFILERS.started do return
     time.stopwatch_start(&GLOBAL_PROFILERS.stopwatch)
     GLOBAL_PROFILERS.started = true
 }
 
 stop :: proc() {
+    if !GLOBAL_PROFILERS.inited do return
     if !GLOBAL_PROFILERS.started do return
 
     time.stopwatch_stop(&GLOBAL_PROFILERS.stopwatch)
@@ -113,6 +115,7 @@ stop :: proc() {
 // while profiling).
 //
 register :: proc() {
+    if !GLOBAL_PROFILERS.inited do return
     sync.lock(&GLOBAL_PROFILERS.mutex)
     defer sync.unlock(&GLOBAL_PROFILERS.mutex)
 
@@ -151,6 +154,7 @@ register :: proc() {}
 when PROFILER_ENABLED {
 
 region_begin :: proc(name: string) {
+    if !GLOBAL_PROFILERS.started do return
     profiler := get_profiler()
 
     // get or insert the entry
@@ -179,6 +183,7 @@ region_begin :: proc(name: string) {
 }
 
 region_end :: proc(name: string) {
+    if !GLOBAL_PROFILERS.started do return
     profiler := get_profiler()
     entry, found := &profiler.entries[name]
     assert(found)
@@ -200,16 +205,19 @@ region_end :: proc(name: string) {
 
 @(deferred_in=region_end)
 region :: proc(name: string) -> bool {
+    if !GLOBAL_PROFILERS.started do return true
     region_begin(name)
     return true
 }
 
 procedure_end :: proc(loc := #caller_location) {
+    if !GLOBAL_PROFILERS.started do return
     region_end(loc.procedure)
 }
 
 @(deferred_in=procedure_end)
 procedure :: proc(loc := #caller_location) {
+    if !GLOBAL_PROFILERS.started do return
     region_begin(loc.procedure)
 }
 

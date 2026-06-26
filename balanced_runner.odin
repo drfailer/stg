@@ -6,6 +6,7 @@ import "core:sync"
 import "base:intrinsics"
 import "core:container/queue"
 import "core:fmt"
+import "core:log"
 
 import prof "profiler"
 
@@ -75,7 +76,7 @@ add_thread_group :: proc(runner: ^Runner, helper_thread_count: uint) -> ^WorkerG
 
 push_job_runner :: proc(runner: ^Runner, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil) {
     data := data
-    data.job_tracker = tracker
+    if tracker != nil do data.job_tracker = tracker
     task, task_exists := runner.tasks[task_proc]
     ensure(task_exists, "tasks must be registered with add_task to be used")
     queue_push(&task.task_info.queue, data)
@@ -89,22 +90,24 @@ TaskInfo :: struct {
     procedure: TaskProc,
     thread_count: uint,
     data: rawptr,
-    shared_space: SharedSpace,
+    shared_space: BalancedSharedSpace,
     queue: MPMCQueue(Data, 1024),
     // --- the queue is aligned so it adds some padding for the locks atomics
     active_worker_count: uint,
     is_ready: bool,
 }
 
+BalancedSharedSpace :: struct {
+    using shared_space: SharedSpace,
+    cancel_barrier: CancelBarrier,
+    spin_barriers: [8]SpinBarrier,
+    data: [2]Data,
+    has_data: [2]bool,
+}
+
 TaskKind :: enum {
     Standard,
     Shared,
-}
-
-SharedSpace :: struct {
-    barrier: Barrier,
-    data: [2]Data,
-    has_data: [2]bool,
 }
 
 task_info_create :: proc(kind: TaskKind, procedure: TaskProc, thread_count: uint, data: rawptr) -> ^TaskInfo {
@@ -467,8 +470,8 @@ process_shared_tasks :: proc(worker: ^Worker) {
             }
             process_shared_task(worker, task_info)
             if sync.atomic_sub(&task_info.active_worker_count, 1) == 1 {
-                sync.atomic_store(&task_info.shared_space.barrier.state[0], 0)
-                sync.atomic_store(&task_info.shared_space.barrier.state[1], 0)
+                sync.atomic_store(&task_info.shared_space.cancel_barrier.state[0], 0)
+                sync.atomic_store(&task_info.shared_space.cancel_barrier.state[1], 0)
                 make_task_unready(worker.group, task_info)
             }
         } else {
@@ -482,28 +485,27 @@ process_shared_tasks :: proc(worker: ^Worker) {
 
 @(private="file")
 process_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
-    assert(queue_size(&task_info.queue) > 0)
     ctx := TaskContext{worker, task_info, &task_info.shared_space}
     barrier_state_index: u8
     buf_index: uint = 0
 
     if worker.local_index == 0 {
-        ctx.shared_space.data[0], ctx.shared_space.has_data[0] = queue_pop(&task_info.queue)
+        task_info.shared_space.data[0], task_info.shared_space.has_data[0] = queue_pop(&task_info.queue)
         sync.atomic_sub(&worker.group.shared_tasks_workload_info.pending_jobs_count, 1)
     }
 
     for {
-        barrier_wait(&task_info.shared_space.barrier, &barrier_state_index, u32(task_info.thread_count))
-        if !ctx.shared_space.has_data[buf_index] do break
+        cancel_barrier_wait(&task_info.shared_space.cancel_barrier, &barrier_state_index, u32(task_info.thread_count))
+        if !task_info.shared_space.has_data[buf_index] do break
 
         if worker.local_index == 0 {
-            ctx.shared_space.data[1 - buf_index], ctx.shared_space.has_data[1 - buf_index] = queue_pop(&task_info.queue)
-            if ctx.shared_space.has_data[1 - buf_index] {
+            task_info.shared_space.data[1 - buf_index], task_info.shared_space.has_data[1 - buf_index] = queue_pop(&task_info.queue)
+            if task_info.shared_space.has_data[1 - buf_index] {
                 sync.atomic_sub(&worker.group.shared_tasks_workload_info.pending_jobs_count, 1)
             }
         }
 
-        task_info.procedure.(TaskProcShared)(ctx, ctx.shared_space.data[buf_index], worker.local_index, task_info.thread_count)
+        task_info.procedure.(TaskProcShared)(ctx, task_info.shared_space.data[buf_index], worker.local_index, task_info.thread_count)
         buf_index = 1 - buf_index
     }
 }

@@ -362,6 +362,28 @@ map_get_ptr :: proc(m: ^map[$K]$V, key: K) -> ^V {
 }
 
 @(private="file")
+compile_global_entries :: proc() {
+    if !GLOBAL_PROFILERS.inited do return
+    time.stopwatch_stop(&GLOBAL_PROFILERS.stopwatch)
+    if len(GLOBAL_PROFILERS.global_entries) > 0 do return
+    // compute the global entries (merge informations from all the threads)
+    for thread_id, profiler in GLOBAL_PROFILERS.profilers {
+        for entry_name, entry in profiler.entries {
+            global_entry := map_get_ptr(&GLOBAL_PROFILERS.global_entries, entry_name)
+            for parent_name, parent_info in entry.parents {
+                global_parent_info := map_get_ptr(&global_entry.parents, parent_name)
+                global_parent_info.call_count += parent_info.call_count
+            }
+            global_entry.min = min(entry.min, global_entry.min) if global_entry.min > 0 else entry.min
+            global_entry.max = max(entry.max, global_entry.max)
+            global_entry.ttl += entry.ttl
+            global_entry.count += entry.count
+            global_entry.thread_count += 1
+        }
+    }
+}
+
+// this function is available to the exterior
 duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {
     ns := time.duration_nanoseconds(dur)
     if ns < 0 { ns = 0 }
@@ -381,27 +403,5 @@ duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -
         return fmt.aprintf("%d.%03dus", us, remainder_ns, allocator = allocator)
     } else {
         return fmt.aprintf("%dns", ns, allocator = allocator)
-    }
-}
-
-@(private="file")
-compile_global_entries :: proc() {
-    if !GLOBAL_PROFILERS.inited do return
-    time.stopwatch_stop(&GLOBAL_PROFILERS.stopwatch)
-    if len(GLOBAL_PROFILERS.global_entries) > 0 do return
-    // compute the global entries (merge informations from all the threads)
-    for thread_id, profiler in GLOBAL_PROFILERS.profilers {
-        for entry_name, entry in profiler.entries {
-            global_entry := map_get_ptr(&GLOBAL_PROFILERS.global_entries, entry_name)
-            for parent_name, parent_info in entry.parents {
-                global_parent_info := map_get_ptr(&global_entry.parents, parent_name)
-                global_parent_info.call_count += parent_info.call_count
-            }
-            global_entry.min = min(entry.min, global_entry.min) if global_entry.min > 0 else entry.min
-            global_entry.max = max(entry.max, global_entry.max)
-            global_entry.ttl += entry.ttl
-            global_entry.count += entry.count
-            global_entry.thread_count += 1
-        }
     }
 }

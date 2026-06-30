@@ -7,7 +7,7 @@ run:
 	odin run . -debug
 
 test:
-	odin test . -debug
+	odin test . -thread-count:1
 
 release:
 	odin build . -o:speed

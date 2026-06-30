@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:strings"
 import "base:intrinsics"
 
+CACHE_LINE :: 64
 
 // lock free queue /////////////////////////////////////////////////////////////
 

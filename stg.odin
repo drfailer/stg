@@ -5,45 +5,41 @@
 package stg
 
 import "core:sync"
+import "core:thread"
 import "core:log"
 
-// - init
-// - create thread groups
-// - declare tasks:
-// - run: push_task(ctx, task_proc, data) / push_task(ctx, task_proc, data, ticket)
+// job /////////////////////////////////////////////////////////////////////////
 
-// job tracker /////////////////////////////////////////////////////////////////
-
-JobTracker :: struct {
+Job :: struct {
     mutex: sync.Mutex,
     cond: sync.Cond,
     steps: int,
 }
 
-job_tracker :: proc(step_count := 1) -> JobTracker {
-    return JobTracker{steps = step_count}
+job :: proc(step_count := 1) -> Job {
+    return Job{steps = step_count}
 }
 
-job_done_tracker :: proc(tracker: ^JobTracker) {
-    if sync.atomic_sub(&tracker.steps, 1) <= 1 {
-        sync.cond_broadcast(&tracker.cond)
+job_done_from_job :: proc(job: ^Job) {
+    if sync.atomic_sub(&job.steps, 1) <= 1 {
+        sync.cond_broadcast(&job.cond)
     }
 }
 
-job_done_data :: proc(data: Data) {
-    ensure(data.job_tracker != nil, "called `job_done` with nil data job tracker is nil")
-    job_done_tracker(data.job_tracker)
+job_done_from_data :: proc(data: Data) {
+    ensure(data.job != nil, "called `job_done` with nil data job is nil")
+    job_done_from_job(data.job)
 }
 
-job_done :: proc { job_done_tracker, job_done_data }
+job_done :: proc { job_done_from_job, job_done_from_data }
 
-job_wait :: proc(tracker: ^JobTracker) {
-    sync.mutex_lock(&tracker.mutex)
+job_wait :: proc(job: ^Job) {
+    sync.mutex_lock(&job.mutex)
     for {
-        if sync.atomic_load(&tracker.steps) <= 0 do break
-        sync.cond_wait(&tracker.cond, &tracker.mutex)
+        if sync.atomic_load(&job.steps) <= 0 do break
+        sync.cond_wait(&job.cond, &job.mutex)
     }
-    sync.mutex_unlock(&tracker.mutex)
+    sync.mutex_unlock(&job.mutex)
 }
 
 // data ////////////////////////////////////////////////////////////////////////
@@ -51,7 +47,7 @@ job_wait :: proc(tracker: ^JobTracker) {
 Data :: struct {
     type: typeid,
     ptr: rawptr,
-    job_tracker: ^JobTracker,
+    job: ^Job,
     // pool: ^DataPool,
 }
 
@@ -63,11 +59,39 @@ data_type :: proc(data: Data) -> typeid {
     return data.type
 }
 
-make_data :: proc(ptr: ^$T, job_tracker: ^JobTracker = nil) -> Data {
-    return Data{T, ptr, job_tracker}
+make_data_data :: proc(ptr: ^$T, job: ^Job = nil) -> Data
+    where T != Job {
+    return Data{T, ptr, job}
 }
 
+make_data_job :: proc(job: ^Job) -> Data {
+    return Data{Job, nil, job}
+}
+
+make_data :: proc { make_data_data, make_data_job }
+
 // tasks ///////////////////////////////////////////////////////////////////////
+
+TaskKind :: enum {
+    Standard,
+    Shared,
+}
+
+TaskInfo :: struct {
+    kind: TaskKind,
+    procedure: TaskProc,
+    data: rawptr,
+    shared_space: SharedSpace,
+    max_thread_count: int,
+    group: ^WorkerGroup,
+}
+
+SharedSpace :: struct {
+    barrier: sync.Barrier,
+    user_barriers: [8]SpinBarrier,
+    data: Maybe(Data),
+    impl: rawptr,
+}
 
 TaskContext :: struct {
     worker: ^Worker,
@@ -75,26 +99,23 @@ TaskContext :: struct {
     shared_space: ^SharedSpace,
 }
 
-SharedSpace :: struct {
-    user_barriers: [8]SpinBarrier,
-}
-
 TaskProcStandard :: proc(ctx: TaskContext, data: Data)
-TaskProcShared :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: uint)
+TaskProcShared :: proc(ctx: TaskContext, data: Data, thread_index, thread_count: int)
 
 TaskProc :: union {
     TaskProcStandard,
     TaskProcShared,
 }
 
-push_job_task :: proc(ctx: TaskContext, task_proc: TaskProc, data := Data{}, tracker: ^JobTracker = nil) {
-    push_job_runner(ctx.worker.group.runner, task_proc, data, tracker)
+add_job_data :: proc(ctx: TaskContext, task: TaskProc, data: Data) {
+    runner_add_job_data(ctx.worker.group.runner, task, data)
 }
 
-push_job :: proc {
-    push_job_runner,
-    push_job_task,
+add_job_job :: proc(ctx: TaskContext, task: TaskProc, job: ^Job) {
+    runner_add_job_job(ctx.worker.group.runner, task, job)
 }
+
+add_job :: proc { add_job_data, add_job_job, runner_add_job_data, runner_add_job_job }
 
 thread_id :: proc(ctx: TaskContext) -> int {
     return ctx.worker.id
@@ -104,8 +125,53 @@ task_data :: proc(ctx: TaskContext, $T: typeid) -> ^T {
     return cast(^T)ctx.task_info.data
 }
 
-sync :: proc(ctx: TaskContext, count: uint = 0, branch_id := 0) {
+sync :: proc(ctx: TaskContext, count: int = 0, branch_id := 0) {
     ensure(branch_id < len(ctx.shared_space.user_barriers))
-    count := count if count > 0 else ctx.task_info.thread_count
+    count := count if count > 0 else ctx.task_info.max_thread_count
     spin_barrier_wait(&ctx.shared_space.user_barriers[branch_id], count)
+}
+
+// runner //////////////////////////////////////////////////////////////////////
+
+Runner :: struct {
+    groups: [dynamic]^WorkerGroup,
+    tasks: map[TaskProc]^TaskInfo,
+    mutex: sync.Mutex,
+    // TODO: should the runner have a multi-pool?
+    add_group: proc(runner: ^Runner, nb_threads: int) -> int,
+    add_task: proc(runner: ^Runner, group: int, task: TaskProc, nb_threads: int, data: rawptr),
+    add_job: proc(runner: ^Runner, task: TaskProc, data: Data),
+}
+
+WorkerGroup :: struct {
+    id: int,
+    runner: ^Runner,
+    workers: [dynamic]^Worker,
+    mutex: sync.Mutex,
+    cond: sync.Cond,
+    tasks: [TaskKind][dynamic]^TaskInfo,
+}
+
+Worker :: struct {
+    id: int,
+    local_id: int,
+    group: ^WorkerGroup,
+    thread: ^thread.Thread,
+    can_terminate: bool,
+}
+
+add_group :: proc(runner: ^Runner, nb_threads: int) -> int {
+    return runner.add_group(runner, nb_threads)
+}
+
+add_task :: proc(runner: ^Runner, task: TaskProc, nb_threads: int = 1, data: rawptr = nil, group := 0) {
+    runner.add_task(runner, group, task, nb_threads, data)
+}
+
+runner_add_job_data :: proc(runner: ^Runner, task: TaskProc, data: Data) {
+    runner.add_job(runner, task, data)
+}
+
+runner_add_job_job :: proc(runner: ^Runner, task: TaskProc, job: ^Job) {
+    runner.add_job(runner, task, make_data(job))
 }

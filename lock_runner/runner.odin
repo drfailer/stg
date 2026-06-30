@@ -22,8 +22,6 @@ Runner :: struct {
 WorkerGroup :: struct {
     using group: stg.WorkerGroup,
     ready_lists: [stg.TaskKind]ReadyList,
-    running_worker_count: int,
-    needed_worker_count: int,
     needed_shared_worker_count: int,
 }
 
@@ -82,6 +80,7 @@ runner_stop :: proc(runner: ^Runner) {
         sync.cond_broadcast(&group.cond)
         for &worker in group.workers {
             thread.join(worker.thread)
+            thread.destroy(worker.thread)
         }
     }
 }
@@ -134,17 +133,15 @@ add_job :: proc(runner: ^Runner, task: stg.TaskProc, data: stg.Data) {
     task_info := cast(^TaskInfo)runner.tasks[task]
     group := cast(^WorkerGroup)task_info.group
     stg.queue_push(&task_info.queue, data)
-    // TODO: we can prevent the lock in some cases if the index is atomic
-    sync.lock(&task_info.mutex)
-    if task_info.ready_list_index < 0 {
-        task_info.ready_list_index = ready_list_add(&group.ready_lists[task_info.kind], task_info)
-        sync.atomic_add(&group.needed_worker_count, task_info.max_thread_count) // NOTE: idealy we should only specify the number of elements (for the standard tasks)
+    if sync.guard(&group.ready_lists[task_info.kind].mutex) {
+        if sync.guard(&task_info.mutex) {
+            add_task_info_to_ready_list(task_info)
+            if task_info.cur_thread_count < task_info.max_thread_count &&
+               task_info.cur_thread_count < int(stg.queue_size(&task_info.queue)) {
+                sync.cond_signal(&group.cond) // wakeup a worker for the processing
+            }
+        }
     }
-    if task_info.cur_thread_count < task_info.max_thread_count &&
-       task_info.cur_thread_count < int(stg.queue_size(&task_info.queue)) {
-        sync.cond_signal(&group.cond) // wakeup a worker for the processing
-    }
-    sync.unlock(&task_info.mutex)
 }
 
 @(private)
@@ -154,14 +151,13 @@ worker_run :: proc(worker: ^Worker) {
         if sync.guard(&group.mutex) { // sleep
             for {
                 if sync.atomic_load(&worker.can_terminate) do return
-                if sync.atomic_load(&group.needed_worker_count) > sync.atomic_load(&group.running_worker_count) do break
                 if sync.atomic_load(&group.needed_shared_worker_count) > 0 do break
+                if ready_list_size(&group.ready_lists[.Standard]) > 0 do break
+                if ready_list_size(&group.ready_lists[.Shared]) > 0 do break
                 sync.cond_wait(&group.cond, &group.mutex)
             }
         }
-        sync.atomic_add(&group.running_worker_count, 1)
         process_tasks(worker)
-        sync.atomic_sub(&group.running_worker_count, 1)
     }
 }
 
@@ -197,7 +193,6 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
                 if task_info.cur_thread_count < task_info.max_thread_count && stg.queue_size(&task_info.queue) > 0 {
                     worker.local_id = task_info.cur_thread_count
                     task_info.cur_thread_count += 1
-                    sync.atomic_sub(&group.needed_worker_count, 1)
                     task_found = true
                     break
                 }
@@ -214,9 +209,7 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
     //reset
     if sync.guard(&group.ready_lists[.Standard].mutex) {
         if sync.guard(&task_info.mutex) {
-            if task_info.ready_list_index >= 0 && stg.queue_size(&task_info.queue) == 0 {
-                remove_task_info_from_ready_list(task_info)
-            }
+            remove_task_info_from_ready_list(task_info)
             task_info.cur_thread_count -= 1
         }
     }
@@ -225,7 +218,6 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
 
 @(private)
 run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
-    log.debugf("worker = {}, group = {}, runner = {}", rawptr(worker), rawptr(worker.group), rawptr(worker.group.runner))
     ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
     for {
         data := stg.queue_pop(&task_info.queue) or_break
@@ -256,7 +248,6 @@ process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
                         // standard tasks
                         if !is_helper do sync.atomic_sub(&group.needed_shared_worker_count, 1)
                     }
-                    sync.atomic_sub(&group.needed_worker_count, 1)
                     task_found = true
                     break
                 }
@@ -274,9 +265,7 @@ process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
     // reset
     if sync.guard(&group.ready_lists[.Shared].mutex) {
         if sync.guard(&task_info.mutex) {
-            if task_info.ready_list_index >= 0 && stg.queue_size(&task_info.queue) == 0 {
-                remove_task_info_from_ready_list(task_info)
-            }
+            remove_task_info_from_ready_list(task_info)
             task_info.cur_thread_count = 0
         }
     }
@@ -315,22 +304,28 @@ ready_list_destroy :: proc(list: ^ReadyList) {
     delete(list.datas)
 }
 
-ready_list_add :: proc(list: ^ReadyList, task_info: ^TaskInfo) -> int {
-    sync.lock(&list.mutex)
-    defer sync.unlock(&list.mutex)
-    append(&list.datas, task_info)
-    return len(list.datas) - 1
-}
-
 ready_list_size :: proc(list: ^ReadyList) -> int {
     sync.lock(&list.mutex)
     defer sync.unlock(&list.mutex)
     return len(list.datas)
 }
 
+//
+// note: those functions expect the ready list and the task to be locked
+//
+
+@(private)
+add_task_info_to_ready_list :: proc(task_info: ^TaskInfo) {
+    if task_info == nil || task_info.ready_list_index >= 0 do return
+    group := cast(^WorkerGroup)task_info.group
+    list := &group.ready_lists[task_info.kind]
+    append(&list.datas, task_info)
+    task_info.ready_list_index = len(list.datas) - 1
+}
+
 @(private)
 remove_task_info_from_ready_list :: proc(task_info: ^TaskInfo) {
-    if task_info == nil || task_info.ready_list_index < 0 do return
+    if task_info == nil || task_info.ready_list_index < 0 || stg.queue_size(&task_info.queue) > 0 do return
     group := cast(^WorkerGroup)task_info.group
     idx := task_info.ready_list_index
     task_kind := task_info.kind

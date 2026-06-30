@@ -10,6 +10,7 @@ import "core:container/queue"
 import "core:mem"
 import vmem "core:mem/virtual"
 import "../../"
+import "../common"
 import lr "../../lock_runner"
 import prof "../../profiler"
 
@@ -393,12 +394,7 @@ test_small_int :: proc(t: ^testing.T) {
         matrix_print(E, "E")
         matrix_print(C, "C")
     }
-
-    for row in 0..<uint(MATRIX_SIZE) {
-        for col in 0..<uint(MATRIX_SIZE) {
-            testing.expect(t, C.data[row * C.cols + col] == E.data[row * E.cols + col])
-        }
-    }
+    testing.expect(t, common.matrix_eq(C.data[:], E.data[:]))
 }
 
 @(test)
@@ -420,34 +416,7 @@ test_medium :: proc(t: ^testing.T) {
 
     dgemm(A, B, E)
     stg_dgemm(A, B, C, TILE_SIZE)
-
-    for row in 0..<uint(MATRIX_SIZE) {
-        for col in 0..<uint(MATRIX_SIZE) {
-            testing.expect(t, C.data[row * C.cols + col] == E.data[row * E.cols + col])
-        }
-    }
-}
-
-duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {
-    ns := time.duration_nanoseconds(dur)
-    if ns < 0 { ns = 0 }
-
-    s := ns / 1_000_000_000
-    ms := ns / 1_000_000
-    us := ns / 1_000
-
-    if s > 0 {
-        remainder_ms := (ns - s * 1_000_000_000) / 1_000_000
-        return fmt.aprintf("%d.%03ds", s, remainder_ms, allocator = allocator)
-    } else if ms > 0 {
-        remainder_us := (ns - ms * 1_000_000) / 1_000
-        return fmt.aprintf("%d.%03dms", ms, remainder_us, allocator = allocator)
-    } else if us > 0 {
-        remainder_ns := ns - us * 1_000
-        return fmt.aprintf("%d.%03dus", us, remainder_ns, allocator = allocator)
-    } else {
-        return fmt.aprintf("%dns", ns, allocator = allocator)
-    }
+    testing.expect(t, common.matrix_eq(C.data[:], E.data[:]))
 }
 
 main :: proc() {
@@ -476,7 +445,7 @@ main :: proc() {
     time.stopwatch_start(&sw)
     stg_dgemm(data.A, data.B, data.C, TILE_SIZE)
     time.stopwatch_stop(&sw)
-    dur := duration_to_string(time.stopwatch_duration(sw))
+    dur := prof.duration_to_string(time.stopwatch_duration(sw))
     defer delete(dur)
     fmt.printfln("stg_dgemm: {}", dur)
 }

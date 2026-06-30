@@ -31,7 +31,7 @@ Worker :: struct {
     using worker: stg.Worker,
 }
 
-runner_create :: proc(nb_threads := 0) -> (runner: Runner) {
+runner_init :: proc(runner: ^Runner, nb_threads := 0) {
     err := vmem.arena_init_growing(&runner.arena)
     ensure(err == nil)
     allocator := vmem.arena_allocator(&runner.arena)
@@ -40,11 +40,11 @@ runner_create :: proc(nb_threads := 0) -> (runner: Runner) {
     runner.add_group = add_group
     runner.add_task = add_task
     runner.add_job = add_job
-    if nb_threads > 0 do add_group(&runner, nb_threads)
+    if nb_threads > 0 do add_group(runner, nb_threads)
     return
 }
 
-runner_destroy :: proc(runner: ^Runner) {
+runner_fini :: proc(runner: ^Runner) {
     runner_stop(runner)
     for &group_ in runner.groups {
         group := cast(^WorkerGroup)group_
@@ -225,9 +225,10 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
 
 @(private)
 run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
+    log.debugf("worker = {}, group = {}, runner = {}", rawptr(worker), rawptr(worker.group), rawptr(worker.group.runner))
+    ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
     for {
         data := stg.queue_pop(&task_info.queue) or_break
-        ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
         task_info.procedure.(stg.TaskProcStandard)(ctx, data)
     }
 }
@@ -284,6 +285,7 @@ process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
 
 @(private)
 run_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
+    ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
     for {
         sync.barrier_wait(&task_info.shared_space.barrier)
         if worker.local_id == 0 {
@@ -294,7 +296,6 @@ run_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
         }
         sync.barrier_wait(&task_info.shared_space.barrier)
         data := task_info.shared_space.data.? or_break
-        ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
         task_info.procedure.(stg.TaskProcShared)(ctx, data, worker.local_id, task_info.max_thread_count)
     }
 }

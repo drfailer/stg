@@ -5,6 +5,9 @@ import "core:sync"
 import "core:mem"
 import vmem "core:mem/virtual"
 
+// Multi Pool //////////////////////////////////////////////////////////////////
+
+// TODO: for now, we consider the multipool as being thread unsafe, and only a single should access this pool at a time
 MultiPool :: struct {
     pools: map[typeid]Pool,
 }
@@ -56,6 +59,8 @@ multi_pool_release :: proc(multi_pool: ^MultiPool, data: ^$T, loc := #caller_loc
     ensure(T in multi_pool.pools, "the pool for the given type doesn not exsit in the multipool", loc = loc)
     pool_release(&multi_pool.pools[T], data)
 }
+
+// Pool ////////////////////////////////////////////////////////////////////////
 
 // TODO: those should be private
 

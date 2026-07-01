@@ -1,4 +1,4 @@
-package dgemm
+package dgemM
 
 import "cblas"
 import "core:testing"
@@ -10,6 +10,8 @@ import "core:container/queue"
 import "core:mem"
 import vmem "core:mem/virtual"
 import "../../"
+import "../common"
+import lr "../../lock_runner"
 import prof "../../profiler"
 
 ftype :: f64
@@ -80,9 +82,9 @@ split_matrix_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
             tile.data = m.data[row * m.cols + col:]
             tile.ld = m.cols
             switch tid {
-            case MatrixA: stg.push_job(ctx, product_state, stg.make_data(cast(^MatrixTileA)tile))
-            case MatrixB: stg.push_job(ctx, product_state, stg.make_data(cast(^MatrixTileB)tile))
-            case MatrixC: stg.push_job(ctx, sum_state, stg.make_data(cast(^MatrixTileC)tile))
+            case MatrixA: stg.add_job(ctx, product_state, stg.make_data(cast(^MatrixTileA)tile))
+            case MatrixB: stg.add_job(ctx, product_state, stg.make_data(cast(^MatrixTileB)tile))
+            case MatrixC: stg.add_job(ctx, sum_state, stg.make_data(cast(^MatrixTileC)tile))
             case: panic("we should not arrive here")
             }
         }
@@ -118,7 +120,7 @@ product_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
         product_data.p = stg.multi_pool_alloc(self.data_pool, MatrixTileP, wait = true)
         product_data.p.row = a.row
         product_data.p.col = b.col
-        stg.push_job(ctx, product_task, stg.make_data(product_data))
+        stg.add_job(ctx, product_task, stg.make_data(product_data))
     }
 
     switch tid {
@@ -155,7 +157,7 @@ product_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
     p := tiles.p
     cblas.dgemm(.NoTrans, .NoTrans, a.rows, b.cols, a.cols, 1.0, a.data, a.ld,
                 b.data, b.ld, 0, p.data, p.ld)
-    stg.push_job(ctx, sum_state, data)
+    stg.add_job(ctx, sum_state, data)
 }
 
 SumQueue :: struct {
@@ -173,7 +175,7 @@ SumStateData :: struct {
     queues: [dynamic]SumQueue,
     TM, TN, TK: uint,
     progress_counter: uint,
-    job: ^stg.JobTracker,
+    job: ^stg.Job,
     data_pool: ^stg.MultiPool,
 }
 
@@ -193,7 +195,7 @@ sum_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
             ensure(err == nil)
             sum_data.c = c
             sum_data.p = p
-            stg.push_job(ctx, sum_task, stg.make_data(sum_data))
+            stg.add_job(ctx, sum_task, stg.make_data(sum_data))
         } else {
             q.c = c
         }
@@ -210,13 +212,13 @@ sum_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
             sum_data.c = q.c
             sum_data.p = p
             q.c = nil
-            stg.push_job(ctx, sum_task, stg.make_data(sum_data))
+            stg.add_job(ctx, sum_task, stg.make_data(sum_data))
         } else {
             queue.enqueue(&q.ps, p)
         }
     case SumData:
         sd := stg.data_ptr(data, SumData)
-        log.debugf("sum state received sum data: C[{}, {}] (@{})", sd.p.row, sd.p.col, uintptr(sd))
+        log.debugf("sum state received sum data: C[{}, {}] / {} (@{})", sd.p.row, sd.p.col, self.progress_counter - 1, uintptr(sd))
 
         stg.multi_pool_release(self.data_pool, sd.p)
 
@@ -229,7 +231,7 @@ sum_state :: proc(ctx: stg.TaskContext, data: stg.Data) {
         q := &self.queues[sd.c.row * self.TN + sd.c.col]
         if p, ok := queue.pop_front_safe(&q.ps); ok {
             sd.p = p
-            stg.push_job(ctx, sum_task, stg.make_data(sd))
+            stg.add_job(ctx, sum_task, stg.make_data(sd))
         } else {
             q.c = sd.c
             stg.multi_pool_release(self.data_pool, sd)
@@ -252,15 +254,18 @@ sum_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
             c.data[row * c.ld + col] += p.data[row * p.ld + col]
         }
     }
-    stg.push_job(ctx, sum_state, data)
+    stg.add_job(ctx, sum_state, data)
 }
 
 // C[MxN] = A[MxK] * B[KxN]
 stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
-    runner: stg.Runner
-    stg.runner_init(&runner)
-    defer stg.runner_fini(&runner)
-    prof.procedure() // nobody is registering so this is allowed
+    prof.procedure()
+
+    log.info("create runner..")
+    runner: lr.Runner
+    lr.runner_init(&runner, 40)
+    defer lr.runner_fini(&runner)
+
 
     A := cast(MatrixA)A
     B := cast(MatrixB)B
@@ -273,6 +278,7 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     TN := C.cols / tile_size + (C.cols % tile_size == 0 ? 0 : 1)
     TK := A.cols / tile_size + (A.cols % tile_size == 0 ? 0 : 1)
 
+    log.info("setup pools...")
     data_pool: stg.MultiPool
     stg.multi_pool_init_type(&data_pool, MatrixTileA, TM * TK)
     stg.multi_pool_init_type(&data_pool, MatrixTileB, TK * TN)
@@ -295,6 +301,7 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     defer vmem.arena_destroy(&arena)
     allocator := vmem.arena_allocator(&arena)
 
+    log.info("setup task data...")
     split_matrix_task_data := SplitMatrixTaskData{tile_size, &data_pool}
     product_state_data := ProductStateData{make([dynamic]^MatrixTileA, TM * TK, allocator = allocator),
                                            make([dynamic]^MatrixTileB, TK * TN, allocator = allocator),
@@ -302,19 +309,21 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     sum_state_data := SumStateData{make([dynamic]SumQueue, TM * TN, allocator = allocator), TM, TN, TK, TM * TN * TK, nil, &data_pool}
     for &q in sum_state_data.queues do ensure(queue.init(&q.ps, capacity = int(TK / 3), allocator = allocator) == nil)
 
-    group := stg.add_thread_group(&runner, 40)
-    stg.add_task(group, split_matrix_task, 3, data = &split_matrix_task_data)
-    stg.add_task(group, product_state, data = &product_state_data)
-    stg.add_task(group, product_task, 40)
-    stg.add_task(group, sum_state, data = &sum_state_data)
-    stg.add_task(group, sum_task, 40)
-    stg.runner_start(&runner)
+    log.info("add tasks...")
+    stg.add_task(&runner, split_matrix_task, 3, data = &split_matrix_task_data)
+    stg.add_task(&runner, product_state, data = &product_state_data)
+    stg.add_task(&runner, product_task, 40)
+    stg.add_task(&runner, sum_state, data = &sum_state_data)
+    stg.add_task(&runner, sum_task, 40)
 
-    tracker := stg.job_tracker()
+    log.info("start runner...")
+    lr.runner_start(&runner)
+
+    tracker := stg.job()
     sum_state_data.job = &tracker
-    stg.push_job(&runner, split_matrix_task, stg.make_data(&A))
-    stg.push_job(&runner, split_matrix_task, stg.make_data(&B))
-    stg.push_job(&runner, split_matrix_task, stg.make_data(&C))
+    stg.add_job(&runner, split_matrix_task, stg.make_data(&A))
+    stg.add_job(&runner, split_matrix_task, stg.make_data(&B))
+    stg.add_job(&runner, split_matrix_task, stg.make_data(&C))
     stg.job_wait(&tracker)
 }
 
@@ -380,12 +389,7 @@ test_small_int :: proc(t: ^testing.T) {
         matrix_print(E, "E")
         matrix_print(C, "C")
     }
-
-    for row in 0..<uint(MATRIX_SIZE) {
-        for col in 0..<uint(MATRIX_SIZE) {
-            testing.expect(t, C.data[row * C.cols + col] == E.data[row * E.cols + col])
-        }
-    }
+    testing.expect(t, common.matrix_eq(C.data[:], E.data[:]))
 }
 
 @(test)
@@ -407,37 +411,17 @@ test_medium :: proc(t: ^testing.T) {
 
     dgemm(A, B, E)
     stg_dgemm(A, B, C, TILE_SIZE)
-
-    for row in 0..<uint(MATRIX_SIZE) {
-        for col in 0..<uint(MATRIX_SIZE) {
-            testing.expect(t, C.data[row * C.cols + col] == E.data[row * E.cols + col])
-        }
-    }
-}
-
-duration_to_string :: proc(dur: time.Duration, allocator := context.allocator) -> string {
-    ns := time.duration_nanoseconds(dur)
-    if ns < 0 { ns = 0 }
-
-    s := ns / 1_000_000_000
-    ms := ns / 1_000_000
-    us := ns / 1_000
-
-    if s > 0 {
-        remainder_ms := (ns - s * 1_000_000_000) / 1_000_000
-        return fmt.aprintf("%d.%03ds", s, remainder_ms, allocator = allocator)
-    } else if ms > 0 {
-        remainder_us := (ns - ms * 1_000_000) / 1_000
-        return fmt.aprintf("%d.%03dms", ms, remainder_us, allocator = allocator)
-    } else if us > 0 {
-        remainder_ns := ns - us * 1_000
-        return fmt.aprintf("%d.%03dus", us, remainder_ns, allocator = allocator)
-    } else {
-        return fmt.aprintf("%dns", ns, allocator = allocator)
-    }
+    testing.expect(t, common.matrix_eq(C.data[:], E.data[:]))
 }
 
 main :: proc() {
+    log.info("init profiler...")
+    prof.init()
+    defer {
+        prof.print_report_to_file("report.dot", .Dot)
+        prof.fini()
+    }
+
     MATRIX_SIZE :: 10000
     TILE_SIZE :: 1024
 
@@ -463,9 +447,7 @@ main :: proc() {
     time.stopwatch_start(&sw)
     stg_dgemm(data.A, data.B, data.C, TILE_SIZE)
     time.stopwatch_stop(&sw)
-    dur := duration_to_string(time.stopwatch_duration(sw))
+    dur := prof.duration_to_string(time.stopwatch_duration(sw))
     defer delete(dur)
     fmt.printfln("stg_dgemm: {}", dur)
-
-    prof.generate_report("report.dot", .Dot)
 }

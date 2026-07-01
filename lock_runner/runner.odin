@@ -148,10 +148,12 @@ add_job :: proc(runner: ^Runner, task: stg.TaskProc, data: stg.Data) {
 @(private)
 worker_run :: proc(worker: ^Worker) {
     prof.register_thread()
+    prof.procedure()
     group := cast(^WorkerGroup)worker.group
     for {
         if sync.guard(&group.mutex) { // sleep
             for {
+                prof.region("worker_sleep")
                 if sync.atomic_load(&worker.can_terminate) do return
                 if sync.atomic_load(&group.needed_shared_worker_count) > 0 do break
                 if ready_list_size(&group.ready_lists[.Standard]) > 0 do break
@@ -159,7 +161,9 @@ worker_run :: proc(worker: ^Worker) {
                 sync.cond_wait(&group.cond, &group.mutex)
             }
         }
+        prof.region_begin("worker_process")
         process_tasks(worker)
+        prof.region_end("worker_process")
     }
 }
 
@@ -183,6 +187,7 @@ process_tasks :: proc(worker: ^Worker) {
 
 @(private)
 process_standard_tasks :: proc(worker: ^Worker) -> bool {
+    prof.procedure()
     group := cast(^WorkerGroup)worker.group
     task_info: ^TaskInfo
     task_found := false
@@ -220,6 +225,7 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
 
 @(private)
 run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
+    prof.procedure()
     ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
     for {
         data := stg.queue_pop(&task_info.queue) or_break
@@ -229,6 +235,7 @@ run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
 
 @(private)
 process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
+    prof.procedure()
     group := cast(^WorkerGroup)worker.group
     task_info: ^TaskInfo
     task_found := false
@@ -276,6 +283,7 @@ process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
 
 @(private)
 run_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
+    prof.procedure()
     ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
     for {
         sync.barrier_wait(&task_info.shared_space.barrier)

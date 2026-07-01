@@ -259,9 +259,6 @@ sum_task :: proc(ctx: stg.TaskContext, data: stg.Data) {
 
 // C[MxN] = A[MxK] * B[KxN]
 stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
-    log.info("init profiler...")
-    prof.init()
-    defer prof.fini()
     prof.procedure()
 
     log.info("create runner..")
@@ -328,8 +325,6 @@ stg_dgemm :: proc(A, B, C: Matrix, tile_size: uint) {
     stg.add_job(&runner, split_matrix_task, stg.make_data(&B))
     stg.add_job(&runner, split_matrix_task, stg.make_data(&C))
     stg.job_wait(&tracker)
-
-    prof.print_report_to_file("report.dot", .Dot)
 }
 
 MatrixInitKind :: enum {Zero, Int, Float}
@@ -420,6 +415,13 @@ test_medium :: proc(t: ^testing.T) {
 }
 
 main :: proc() {
+    log.info("init profiler...")
+    prof.init()
+    defer {
+        prof.print_report_to_file("report.dot", .Dot)
+        prof.fini()
+    }
+
     MATRIX_SIZE :: 10000
     TILE_SIZE :: 1024
 

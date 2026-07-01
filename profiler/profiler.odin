@@ -302,7 +302,7 @@ generate_dot_report :: proc(file: ^os.File) {
     fmt.fprintfln(file, "label=\"execution time = {}\";", ttl_time_str)
 
     // set the src entry
-    fmt.fprintfln(file, "src [label=\"src ({})\",shape=rectangle];", ttl_time_str)
+    fmt.fprintfln(file, "src [label=\"{} ({})\",shape=rectangle];", os.args[0], ttl_time_str)
 
     for entry_name, entry in GLOBAL_PROFILERS.global_entries {
         avg := time.Duration(f64(entry.ttl) / f64(entry.count))
@@ -311,6 +311,7 @@ generate_dot_report :: proc(file: ^os.File) {
         str_max := duration_to_string(entry.max, context.temp_allocator)
         str_ttl := duration_to_string(entry.ttl, context.temp_allocator)
         ttl_avg := f64(entry.ttl) / f64(entry.thread_count)
+        str_ttl_avg := duration_to_string(cast(time.Duration)ttl_avg)
         ratio   := ttl_avg / f64(global_ttl)
         percent := 100 * ratio
         // determin the node colors
@@ -318,8 +319,8 @@ generate_dot_report :: proc(file: ^os.File) {
         green := u8(1 - 2 * abs(ratio - 0.5))
         blue := u8(255 * (1 - ratio))
 
-        fmt.fprintfln(file, "{} [label=\"{}\\navg = {}, min = {}, max = {}\\nttl = {}, count = {}\\nnumber of threads = {}\\n{:.3f}%%\",shape=rectangle,color=\"#%2X%2X%2X\",penwidth=2];",
-            entry_name, entry_name, str_avg, str_min, str_max, str_ttl, entry.count, entry.thread_count, percent, red, green, blue)
+        fmt.fprintfln(file, "{} [label=\"{}\\ncount = {}\\navg = {}, min = {}, max = {}\\nttl = {} ({:.3f}%%)\\nthreads = {} ({})\",shape=rectangle,color=\"#%2X%2X%2X\",penwidth=2];",
+            entry_name, entry_name, entry.count, str_avg, str_min, str_max, str_ttl_avg, percent, entry.thread_count, str_ttl, red, green, blue)
 
         for parent_name, parent_info in entry.parents {
             parent_entry, parent_found := &GLOBAL_PROFILERS.global_entries[parent_name]

@@ -5,6 +5,7 @@ import "core:thread"
 import "core:sync"
 import "core:log"
 import stg "../"
+import prof "../profiler"
 
 TaskInfo :: struct {
     using task_info: stg.TaskInfo,
@@ -146,6 +147,7 @@ add_job :: proc(runner: ^Runner, task: stg.TaskProc, data: stg.Data) {
 
 @(private)
 worker_run :: proc(worker: ^Worker) {
+    prof.register_thread()
     group := cast(^WorkerGroup)worker.group
     for {
         if sync.guard(&group.mutex) { // sleep

@@ -25,6 +25,7 @@ dgemm_task :: proc(ctx: stg.TaskContext, data: stg.Data, thread_idx, thread_coun
     log.debugf("thread {}/{} enter dgemm task", thread_idx, thread_count)
 
     // each thread will compute a portion of the matrix
+    prof.region_begin("process_blocks")
     for bi: uint = 0; ; bi += 1 {
         block_idx := bi * uint(thread_count) + uint(thread_idx)
         block_x := block_idx % block_row_size
@@ -55,16 +56,17 @@ dgemm_task :: proc(ctx: stg.TaskContext, data: stg.Data, thread_idx, thread_coun
             cblas.dgemm(.NoTrans, .NoTrans, M, N, K, 1, A, params.K, B, params.N, 1, C, params.N)
         }
     }
+    prof.region_end("process_blocks")
 
+    prof.region_begin("sync")
     stg.sync(ctx)
+    prof.region_end("sync")
 
     // complete the job at the end
     if thread_idx == 0 do stg.job_done(data)
 }
 
 stg_dgemm :: proc(A, B, C: []f64, M, N, K: uint, block_w, block_h: uint, thread_count: int) {
-    prof.init()
-    defer prof.fini()
     prof.procedure()
 
     runner: lr.Runner
@@ -78,7 +80,6 @@ stg_dgemm :: proc(A, B, C: []f64, M, N, K: uint, block_w, block_h: uint, thread_
     job := stg.job()
     stg.add_job(&runner, dgemm_task, stg.make_data(&params, &job))
     stg.job_wait(&job)
-    log.warn("finished")
 }
 
 MatrixInitKind :: enum {Zero, Int, Float}
@@ -164,6 +165,12 @@ test_medium :: proc(t: ^testing.T) {
 }
 
 main :: proc() {
+    prof.init()
+    defer {
+        prof.print_report_to_file("report.dot", .Dot)
+        prof.fini()
+    }
+
     MATRIX_SIZE :: 10000
     BLOCK_H :: 512
     BLOCK_W :: 512

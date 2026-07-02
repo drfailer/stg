@@ -78,6 +78,7 @@ runner_start :: proc(runner: ^Runner) {
         group := group
         for &list, task_kind in group.ready_lists do ready_list_init(&list, len(group.tasks[task_kind]), allocator)
         for &worker in group.workers {
+            if worker.thread != nil do continue // do not restart
             worker.thread = thread.create_and_start_with_poly_data(worker, worker_run, init_context = context)
         }
     }

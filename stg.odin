@@ -83,7 +83,6 @@ TaskInfo :: struct {
     data: rawptr,
     shared_space: SharedSpace,
     max_thread_count: int,
-    group: ^WorkerGroup,
 }
 
 SharedSpace :: struct {
@@ -94,6 +93,7 @@ SharedSpace :: struct {
 }
 
 TaskContext :: struct {
+    runner: ^Runner,
     worker: ^Worker,
     task_info: ^TaskInfo,
     shared_space: ^SharedSpace,
@@ -108,11 +108,11 @@ TaskProc :: union {
 }
 
 add_job_data :: proc(ctx: TaskContext, task: TaskProc, data: Data) {
-    runner_add_job_data(ctx.worker.group.runner, task, data)
+    runner_add_job_data(ctx.runner, task, data)
 }
 
 add_job_job :: proc(ctx: TaskContext, task: TaskProc, job: ^Job) {
-    runner_add_job_job(ctx.worker.group.runner, task, job)
+    runner_add_job_job(ctx.runner, task, job)
 }
 
 add_job :: proc { add_job_data, add_job_job, runner_add_job_data, runner_add_job_job }
@@ -131,33 +131,20 @@ sync :: proc(ctx: TaskContext, count: int = 0, branch_id := 0) {
     spin_barrier_wait(&ctx.shared_space.user_barriers[branch_id], count)
 }
 
+// TODO: we need a `last` function that return true when count is reached but that do not block the other threads
+
 // runner //////////////////////////////////////////////////////////////////////
 
 Runner :: struct {
-    groups: [dynamic]^WorkerGroup,
-    tasks: map[TaskProc]^TaskInfo,
-    mutex: sync.Mutex,
     // TODO: should the runner have a multi-pool?
     add_group: proc(runner: ^Runner, nb_threads: int) -> int,
     add_task: proc(runner: ^Runner, group: int, task: TaskProc, nb_threads: int, data: rawptr),
     add_job: proc(runner: ^Runner, task: TaskProc, data: Data),
 }
 
-WorkerGroup :: struct {
-    id: int,
-    runner: ^Runner,
-    workers: [dynamic]^Worker,
-    mutex: sync.Mutex,
-    cond: sync.Cond,
-    tasks: [TaskKind][dynamic]^TaskInfo,
-}
-
 Worker :: struct {
     id: int,
     local_id: int,
-    group: ^WorkerGroup,
-    thread: ^thread.Thread,
-    can_terminate: bool,
 }
 
 add_group :: proc(runner: ^Runner, nb_threads: int) -> int {

@@ -9,6 +9,7 @@ import prof "../profiler"
 
 TaskInfo :: struct {
     using task_info: stg.TaskInfo,
+    group: ^WorkerGroup,
     cur_thread_count: int,
     mutex: sync.Mutex,
     queue: stg.MPMCQueue(stg.Data, 1024),
@@ -17,25 +18,36 @@ TaskInfo :: struct {
 
 Runner :: struct {
     using runner: stg.Runner,
+    groups: [dynamic]^WorkerGroup,
+    tasks: map[stg.TaskProc]^TaskInfo,
+    mutex: sync.Mutex,
     arena: vmem.Arena,
 }
 
 WorkerGroup :: struct {
-    using group: stg.WorkerGroup,
+    id: int,
+    runner: ^Runner,
+    workers: [dynamic]^Worker,
+    mutex: sync.Mutex,
+    cond: sync.Cond,
+    tasks: [stg.TaskKind][dynamic]^TaskInfo,
     ready_lists: [stg.TaskKind]ReadyList,
     needed_shared_worker_count: int,
 }
 
 Worker :: struct {
     using worker: stg.Worker,
+    group: ^WorkerGroup,
+    thread: ^thread.Thread,
+    can_terminate: bool,
 }
 
 runner_init :: proc(runner: ^Runner, nb_threads := 0) {
     err := vmem.arena_init_growing(&runner.arena)
     ensure(err == nil)
     allocator := vmem.arena_allocator(&runner.arena)
-    runner.groups = make([dynamic]^stg.WorkerGroup)
-    runner.tasks = make(map[stg.TaskProc]^stg.TaskInfo)
+    runner.groups = make([dynamic]^WorkerGroup)
+    runner.tasks = make(map[stg.TaskProc]^TaskInfo)
     runner.add_group = add_group
     runner.add_task = add_task
     runner.add_job = add_job
@@ -46,10 +58,10 @@ runner_init :: proc(runner: ^Runner, nb_threads := 0) {
 runner_fini :: proc(runner: ^Runner) {
     runner_stop(runner)
     for &group_ in runner.groups {
-        group := cast(^WorkerGroup)group_
+        group := group_
         for &tasks in group.tasks {
             for &task_ in tasks {
-                task := cast(^TaskInfo)task_
+                task := task_
                 stg.queue_destroy(&task.queue)
             }
             delete(tasks)
@@ -63,10 +75,10 @@ runner_fini :: proc(runner: ^Runner) {
 runner_start :: proc(runner: ^Runner) {
     allocator := vmem.arena_allocator(&runner.arena)
     for &group in runner.groups {
-        group := cast(^WorkerGroup)group
+        group := group
         for &list, task_kind in group.ready_lists do ready_list_init(&list, len(group.tasks[task_kind]), allocator)
         for &worker in group.workers {
-            worker.thread = thread.create_and_start_with_poly_data(cast(^Worker)worker, worker_run, init_context = context)
+            worker.thread = thread.create_and_start_with_poly_data(worker, worker_run, init_context = context)
         }
     }
 }
@@ -91,7 +103,7 @@ add_group :: proc(runner: ^Runner, nb_threads: int) -> int {
     group := new(WorkerGroup, allocator)
     group.id = len(runner.groups)
     group.runner = runner
-    group.workers = make([dynamic]^stg.Worker, nb_threads, allocator = allocator)
+    group.workers = make([dynamic]^Worker, nb_threads, allocator = allocator)
     for idx in 0..<len(group.workers) {
         worker := new(Worker, allocator)
         worker.id = idx
@@ -99,8 +111,8 @@ add_group :: proc(runner: ^Runner, nb_threads: int) -> int {
         worker.can_terminate = false
         group.workers[idx] = worker
     }
-    group.tasks[.Standard] = make([dynamic]^stg.TaskInfo)
-    group.tasks[.Shared] = make([dynamic]^stg.TaskInfo)
+    group.tasks[.Standard] = make([dynamic]^TaskInfo)
+    group.tasks[.Shared] = make([dynamic]^TaskInfo)
     append(&runner.groups, group)
     return group.id
 }
@@ -108,7 +120,7 @@ add_group :: proc(runner: ^Runner, nb_threads: int) -> int {
 add_task :: proc(runner: ^Runner, group_id: int, task: stg.TaskProc, nb_threads: int, data: rawptr) {
     ensure(group_id < len(runner.groups), "unknown group id")
     allocator := vmem.arena_allocator(&runner.arena)
-    group := cast(^WorkerGroup)runner.groups[group_id]
+    group := runner.groups[group_id]
 
     ensure(nb_threads <= len(group.workers))
 
@@ -131,8 +143,8 @@ add_task :: proc(runner: ^Runner, group_id: int, task: stg.TaskProc, nb_threads:
 
 add_job :: proc(runner: ^Runner, task: stg.TaskProc, data: stg.Data) {
     assert(task in runner.tasks)
-    task_info := cast(^TaskInfo)runner.tasks[task]
-    group := cast(^WorkerGroup)task_info.group
+    task_info := runner.tasks[task]
+    group := task_info.group
     stg.queue_push(&task_info.queue, data)
     if sync.guard(&group.ready_lists[task_info.kind].mutex) {
         if sync.guard(&task_info.mutex) {
@@ -149,7 +161,7 @@ add_job :: proc(runner: ^Runner, task: stg.TaskProc, data: stg.Data) {
 worker_run :: proc(worker: ^Worker) {
     prof.register_thread()
     prof.procedure()
-    group := cast(^WorkerGroup)worker.group
+    group := worker.group
     for {
         if sync.guard(&group.mutex) { // sleep
             for {
@@ -169,7 +181,7 @@ worker_run :: proc(worker: ^Worker) {
 
 @(private)
 process_tasks :: proc(worker: ^Worker) {
-    group := cast(^WorkerGroup)worker.group
+    group := worker.group
     if sync.atomic_load(&group.needed_shared_worker_count) > 0 {
         if sync.atomic_sub(&group.needed_shared_worker_count, 1) > 1 {
             process_shared_tasks(worker, true)
@@ -188,7 +200,7 @@ process_tasks :: proc(worker: ^Worker) {
 @(private)
 process_standard_tasks :: proc(worker: ^Worker) -> bool {
     prof.procedure()
-    group := cast(^WorkerGroup)worker.group
+    group := worker.group
     task_info: ^TaskInfo
     task_found := false
 
@@ -226,7 +238,7 @@ process_standard_tasks :: proc(worker: ^Worker) -> bool {
 @(private)
 run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
     prof.procedure()
-    ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
+    ctx := stg.TaskContext{worker.group.runner, worker, task_info, &task_info.shared_space}
     for {
         data := stg.queue_pop(&task_info.queue) or_break
         task_info.procedure.(stg.TaskProcStandard)(ctx, data)
@@ -236,7 +248,7 @@ run_standard_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
 @(private)
 process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
     prof.procedure()
-    group := cast(^WorkerGroup)worker.group
+    group := worker.group
     task_info: ^TaskInfo
     task_found := false
 
@@ -284,7 +296,7 @@ process_shared_tasks :: proc(worker: ^Worker, is_helper: bool) -> bool {
 @(private)
 run_shared_task :: proc(worker: ^Worker, task_info: ^TaskInfo) {
     prof.procedure()
-    ctx := stg.TaskContext{worker, task_info, &task_info.shared_space}
+    ctx := stg.TaskContext{worker.group.runner, worker, task_info, &task_info.shared_space}
     for {
         sync.barrier_wait(&task_info.shared_space.barrier)
         if worker.local_id == 0 {
@@ -327,7 +339,7 @@ ready_list_size :: proc(list: ^ReadyList) -> int {
 @(private)
 add_task_info_to_ready_list :: proc(task_info: ^TaskInfo) {
     if task_info == nil || task_info.ready_list_index >= 0 do return
-    group := cast(^WorkerGroup)task_info.group
+    group := task_info.group
     list := &group.ready_lists[task_info.kind]
     append(&list.datas, task_info)
     task_info.ready_list_index = len(list.datas) - 1
@@ -336,7 +348,7 @@ add_task_info_to_ready_list :: proc(task_info: ^TaskInfo) {
 @(private)
 remove_task_info_from_ready_list :: proc(task_info: ^TaskInfo) {
     if task_info == nil || task_info.ready_list_index < 0 || stg.queue_size(&task_info.queue) > 0 do return
-    group := cast(^WorkerGroup)task_info.group
+    group := task_info.group
     idx := task_info.ready_list_index
     task_kind := task_info.kind
     ready_count := len(group.ready_lists[task_kind].datas)
